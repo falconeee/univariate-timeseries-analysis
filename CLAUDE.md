@@ -20,7 +20,7 @@ Code, comments and variable names are in **Portuguese** — keep that convention
 | Etapa | Goal | Status in the notebook |
 |---|---|---|
 | 1 — Unsupervised | Deep EDA + clustering to find natural operating patterns | Done and re-done. Descriptive stats, Kruskal-Wallis + η², Q-Q, Mann-Whitney, cross-correlation with lags; the event-row clustering was **removed** and replaced by sliding-window regimes + cross-reactor decomposition + campaign hazard. Conclusion: no natural pre-failure regime exists; the value is in the new variables (see "Unsupervised stage"). |
-| 2 — Supervised | Train on the failure history, cross-validate, **beat the incumbent univariate fixed-threshold model**, cutting false positives | Answered, and the answer is not the expected one: measured out-of-time on the same test period, the **composite rule wins** (F2 0.278) over the incumbent (0.119) and over the supervised models (0.104). See "Validation stage". The ML route is blocked by 31 positives, 90 % of them pre-2019, on a univariate series. |
+| 2 — Supervised | Train on the failure history, cross-validate, **beat the incumbent univariate fixed-threshold model**, cutting false positives | Answered, and the answer is not the expected one: measured out-of-time on the same test period, the **composite rule wins** (F2 0.203) over the incumbent (0.085) and over the supervised models (0.146). See "Validation stage". The ML route is blocked by 36 positives, 84 % of them pre-2019, on a univariate series. |
 | 3 — Handover | Ship the best algorithm in a Bayer-friendly language + make the team autonomous | Not started, but the deliverable is now defined: **the composite rule**, not a model — three conditions on daily statistics, implementable anywhere and auditable by the operators, with the scope declared (proven on C3, undetermined on C1/C2). Nothing is exported yet (`output/` is empty). |
 
 ## The incumbent baseline (`aux_files/Histórico de indicação de ferro nos reatores.pptx`)
@@ -107,7 +107,7 @@ ppm) did three kinds of damage:
   anchored failure. Keeping it takes `max > 10 ppm` from 6 to 7 true positives (F2 0.181 → 0.200).
 
 Effect of keeping them: 13 extra samples, **+4 `Real=0` events at LC 10 ppm** (25 → 29) and **+1 at
-LC 5 ppm** (103 → 104); the 31 anchored failures are unchanged. Robustness to a spurious spike is
+LC 5 ppm** (103 → 104 at the time; the anchored failures are unchanged by the cleaning policy). Robustness to a spurious spike is
 supposed to come from robust features (daily median, p75/p90) and the relative features — not from
 deleting the sample. The old validation still holds as evidence that the *label* is meaningful:
 5 of 16 "real" readings have an inspection within 25 days (31 %) against 1 of 13 "isolated" (8 %).
@@ -160,30 +160,74 @@ OBSERVAÇÕES, SERVIÇOS EXECUTADOS` — **the header text differs between sheet
 
 `DATA` is not a clean date: it mixes real datetimes with free text ranges — `07 - 08/01/2009`,
 `29/05 - 05/06/2011`, `26/06 - 03/07/2013` (crosses months), `08/05 e 12 - 28/05/2020`. All four
-shapes are handled by `_parse_data_inspecao`. `SUBSTITUIDO = Sim` means *something* was replaced
-(often just the agitator shaft or baffle) — an actual reactor swap is detected from the text
-(`equipamento novo`, `substituição do reator`, `pelo spare`, …), which is what `TrocaDoReator` does.
+shapes are handled by `_parse_data_inspecao` (0 parse failures over the 100 records).
+`SUBSTITUIDO = Sim` means *something* was replaced (often just the agitator shaft or baffle) — an
+actual reactor swap is detected from the text (`equipamento novo`, `substituição do reator`,
+`pelo spare`, and — added by the 11/08/2026 audit — `substituir o reator`, `substituído o reator`),
+which is what `TrocaDoReator` does. The same audit widened `Vazamento` (`poro passante`,
+`até a parte metálica`, `infiltraç`) and `Emergencia` (the sheet's own typo `emegência`), and
+introduced `CORRECOES_INSPECAO` — two documented manual overrides the regexes cannot make safely:
+C3 22/10/2024 marked `Vazamento` because the Bayer deck itself calls it *"Vazamento no plug do
+reparo"* (18/10/2024), and C2 15/03/2009 marked `TrocaDoReator` ("o reator ... foi instalado devido
+a furo"; the pattern `reator .* instalado` would false-positive on "plug instalado no local do furo
+do reator"). Corrected rows carry `Corrigido=True`.
 
-**Anchoring events to the data (`ajustar_eventos_para_lacunas`).** When a reactor stops, sampling
-stops with it, so the inspection date usually falls inside a sampling gap. The event is re-anchored
-to the last measurement before the gap (`dias_lacuna=2` by default), one second after it so that the
-triggering sample lands inside the `[ts - dias, ts)` window (`incluir_ultima_medicao=True`). Result:
-**39 of the 60 in-period events move**, from 0.1 to 137 days. Without this, the "lookback window"
-of those events is partly the stop itself.
+**Anchoring events to the data (`ajustar_eventos_para_lacunas`).** Two layers, in order of
+precedence:
+
+1. **Manual anchor from the sheet — the source of truth.** The column
+   **"DATA ANCORADA NA SÉRIE DE FERRO"** (normalized header `data ancorada`, column C since the
+   11/08/2026 update) holds three kinds of content: **56 datetimes**, **41 `Fora do Período da
+   Série`** and **4 `-`** (the last two parse to NaT and fall through to the automatic path).
+   **54 of the 56 datetimes match a real measurement within 60 s** — they are sample timestamps
+   truncated to the minute. So the loader *matches the anchor to its measurement*
+   (`tolerancia_ancora_seg=300`) and anchors **one second after that sample**, so the triggering
+   reading falls inside `[ts - dias, ts)`; when the cell has no usable time (`00:00`) it falls
+   back to the last measurement up to the end of that day (`AncoraCasouMedicao` distinguishes the
+   two). A **typo guard** (`max_desvio_ancora_dias=180`) rejects anchors absurdly far from the
+   record's own date, printing a warning and reverting to the automatic anchor
+   (`AncoraRejeitada=True`). It currently catches exactly one: **C1 07–08/06/2016 anchored to
+   `2018-06-05`** (+728 d) — the time-of-day `10:18` is exactly what the automatic method finds in
+   **2016**-06-05, so the year was mistyped. Rows carry `AncoraManual`, `AncoraCasouMedicao`,
+   `AncoraRejeitada` and `DataAncoradaManual`. With no column at all, behaviour is unchanged.
+2. **Automatic re-anchoring (fallback)** — when a reactor stops, sampling stops with it, so the
+   inspection date usually falls inside a sampling gap. The event is re-anchored to the last
+   measurement before the gap (`dias_lacuna=2` by default), one second after it
+   (`incluir_ultima_medicao=True`). Result: **39 of the 60 in-period events move**, from 0.1 to
+   137 days. Without this, the "lookback window" of those events is partly the stop itself.
 
 Two things this interacts with:
 
 - **The 100 ppm cut changes an anchor.** For C3 24/11/2013 the anchor lands at 12:01:30 with the cut
   and at 12:02:02 without it — the difference is exactly the 264 ppm sample that triggered the stop.
   With the cut in place that sample is outside its own event's window.
-- **Plant-wide gaps are not reactor stops.** 19 gaps hit all three reactors simultaneously
-  (2020-04→05, 2021-08→10, 2023-06→08, 2025-01, 2025-03, …) — those are plant/lab shutdowns.
-  8 of the 39 shifted events fall in one, and re-anchoring them produces a window that describes
-  normal operation weeks before a scheduled outage (the C3 08/05/2020 record moves back 137 days).
-  Detect them by intersecting the gap lists of the three reactors and handle them separately.
+- **Plant-wide gaps are not reactor stops — but what was found during them can be.** 19 gaps hit
+  all three reactors simultaneously (2020-04→05, 2021-08→10, 2023-06→08, 2025-01, 2025-03, …) —
+  those are plant/lab shutdowns, detected by intersecting the three reactors' gap lists. 8 in-period
+  records fall in one. Since 11/08/2026 the rule is selective: records with **real physical damage
+  (`Vazamento`) are rescued** — a hole found at opening existed before the stop, so the last
+  operating window is exactly where a warning would be (C3 28/07/2023, hole in the top head,
+  anchored back 40 d to 17/06; C3 18/07/2024, leaking plug repair) — while swaps *without* damage
+  (preventive/spare, e.g. the C3 08/05/2020 record that would move back 137 days into normal
+  operation) stay excluded. Rescued rows carry `DescobertoEmParada=True` because the failure DATE
+  is uncertain (it was found at opening), and `TipoFalha` classifies every selected failure as
+  `emergência` / `constatada em parada de planta` / `constatada/programada`.
 
-After dropping plant-shutdown events and merging stops within 7 days: **31 failure stops for
-modelling** (C1 11, C2 14, C3 6), of which 17 are emergency/unplanned and 3 mention iron.
+**Anchoring reconciles the deck's date disagreements.** For the C1 bottom-nozzle leak the deck says
+19/01/2024 and the sheet 02/02/2024 — C1 sampling stops on **20/01** and only resumes 04/02, so the
+anchor confirms the deck (the sheet recorded the opening). For the C3 plug leak (deck 18/10/2024,
+sheet 22/10/2024) the anchor lands on 20/10, two days from either source. The 2017 "Substituição da
+BV" (deck 26/11/2017) has no sheet record within 45 days and stays open in the validation sheet.
+
+After the audit, merging stops within 7 days: **36 failure stops for modelling** (C1 11, C2 16,
+C3 9). The path was 31 → 37 (audit rescued 6) → 36, because the plant's anchor column gives
+**C1 04/05/2015 and 13/05/2015 the same anchor** (`2015-05-04 04:07`) — it treats the poro found
+at opening and the emergency stop it caused as **one episode**, so the 7-day merge collapses them.
+Post-2019 failures stay at 6 (vs 3 before the audit) — all low-iron modes (plug leaks,
+found-at-inspection). The merge now **propagates the absorbed record's markers**
+(`Emergencia`/`Vazamento`/`TrocaDoReator`/`FerroCitado`, count in `ApontamentosFundidos`);
+without that the surviving 2015 event would have lost its "emergência" label just for being the
+older of the two.
 
 ### Data facts that change how results should be read
 
@@ -230,6 +274,8 @@ cell with `from utils import *`. Sections, in file order:
 | Cartas de controle | `calcular_ewma`, `otimizar_ewma`, `plotar_carta_ewma`, `avaliar_carta_controle`, `calcular_cusum_dinamico`, `otimizar_cusum_dinamico`, `plotar_carta_cusum` |
 | Protocolo, validação e auditoria | `calcular_ewma_rolante`, `cortes_temporais`, `modelos_padrao_cv`, `avaliar_cv_temporal`, `metricas_alarmes_periodo`, `treinar_detector_janelas`, `alarmes_regra_composta`, `otimizar_regra_composta`, `validar_regra_composta`, `lead_time_regra`, `auditar_janelas_eventos`, `ficha_eventos_para_validacao`, `custo_esperado`, `sensibilidade_custo`, `testar_tendencia` |
 | Escopo por reator | `comparar_escopo_treino`, `calibrar_limiares_por_reator`, `avaliar_regra_calibrada`, `resumo_por_reator` |
+| Modo de falha | `REGRAS_MODO_FALHA`, `MODOS_COM_FERRO`, `CORRECOES_MODO_FALHA`, `classificar_modo_falha`, `avaliar_regra_por_subconjunto` |
+| Otimização da regra | `GRADE_REGRA_AMPLA`, `REFERENCIAS_REGRA`, `preparar_arrays_regra`, `buscar_grade_regra`, `otimizar_regra_por_reator`, `limiares_da_otimizacao`, `sensibilidade_limiares`, `ablacao_ramos_regra`, `validar_calibracao_walkforward`, `comparar_estrategias_calibracao`, `comparar_limiares_por_reator` |
 
 Conventions the module follows: the analysed column is always `COLUNA_FE`; `janelas` is a list of
 days and the slice is `[ts - dias, ts)`; `metodos` is a list of `{"titulo", "df"}` (one subplot per
@@ -270,19 +316,21 @@ The notebook is strictly linear and stateful — run top to bottom. Section orde
    and `TRATAMENTO_ALVO = "Original"` in the classification cells. Do not re-add treatments to
    those dicts; the treatment-comparison EDA cells (descriptive stats, per-treatment effect size,
    violins) are kept deliberately as the evidence for this decision.
-3. **Event tables.** `Real=1` comes from the inspection sheet: `carregar_inspecoes` →
-   `identificar_paradas_de_planta` → `montar_tabela_eventos` (gap re-anchoring, plant-stop exclusion,
-   7-day merge) → `eventos_para_notebook` per reactor. Result: **11 / 14 / 6 failures**.
-   `Real=0` (false positives) are still synthesized by `adicionar_eventos_ultrapassagem`: every
-   sample above `threshold` (**10 ppm**, not the operational 5) at least
-   `DIAS_BASELINE`/`INTERVALO_MIN_DIAS` (15 days) away from any real event and from any previously
-   accepted candidate. The unified table is built by `unificar_eventos` (cross-reactor dedup:
-   drop `Real=0` within 15 days of any `Real=1`, then enforce 15-day spacing between `Real=0`),
-   ending at 31 positives + 29 negatives = 60 rows. The per-reactor cells **append** to the
-   existing event dataframe — re-running one without re-running the cell above duplicates the
-   `Real=0` rows. A second event table at the **operational 5 ppm limit** (`df_eventos_*_lc5`,
-   31 positives + 104 negatives = 135 rows) is built right after the unified table — supervised
-   results should be reported on both.
+3. **Event tables.** `Real=1` comes from the inspection sheet: `carregar_inspecoes` (widened
+   regexes + `CORRECOES_INSPECAO`) → `identificar_paradas_de_planta` → `montar_tabela_eventos`
+   (gap re-anchoring, selective plant-stop rescue, 7-day merge) → `eventos_para_notebook` per
+   reactor. Result: **11 / 16 / 9 failures = 36** (31 before the 11/08/2026 audit; the notebook's
+   "O que a auditoria mudou" cell lists the 6 rescued with sources). `Real=0` (false positives)
+   are still synthesized by `adicionar_eventos_ultrapassagem`: every sample above `threshold`
+   (**10 ppm**, not the operational 5) at least `DIAS_BASELINE`/`INTERVALO_MIN_DIAS` (15 days)
+   away from any real event and from any previously accepted candidate. The unified table is
+   built by `unificar_eventos` (cross-reactor dedup: drop `Real=0` within 15 days of any
+   `Real=1`, then enforce 15-day spacing between `Real=0`), ending at 36 positives + 28
+   negatives = 64 rows. The per-reactor cells **append** to the existing event dataframe —
+   re-running one without re-running the cell above duplicates the `Real=0` rows. A second event
+   table at the **operational 5 ppm limit** (`df_eventos_*_lc5`, 36 positives + 101 negatives =
+   137 rows) is built right after the unified table — supervised results should be reported on
+   both.
 3b. **Baseline.** `avaliar_baseline_lift` (lift vs base rate, 15 and 60 days) and
    `avaliar_detector_diario` (precision/recall/F2 per alarm statistic). This is the reference every
    later result has to beat.
@@ -313,9 +361,13 @@ The notebook is strictly linear and stateful — run top to bottom. Section orde
 11. **Resultados por reator** — `comparar_escopo_treino` (evidence for unified fitting),
    per-reactor lift, `calibrar_limiares_por_reator`, `avaliar_regra_calibrada`, `resumo_por_reator`.
    This is where the per-equipment reading lives; it deliberately has no aggregate row.
-12. **Resumo executivo** — closing narrative written for the Bayer team (findings, limitations,
-   requests to the plant, the rule table with per-reactor thresholds). Its one code cell
-   regenerates the two headline tables from live objects so the numbers cannot go stale.
+12. **Modo de falha** — `classificar_modo_falha` + `avaliar_regra_por_subconjunto`: the effect
+   of dropping events iron cannot see (see "Failure mode" below).
+13. **Resumo executivo** — closing narrative written for the Bayer team. Its one code cell
+   (`fim-tabela`) is deliberately **self-sufficient**: it depends only on the event section and
+   recomputes `margem_cross_reator` if missing, because it had been failing on out-of-order kernel
+   execution (`df_resumo_reator` was defined ~20 cells earlier). It now also reports false alarms
+   per reactor-year, and is built on the **single delivery rule**, matching the scope decision.
 
 ### Feature engineering (the core idea)
 
@@ -366,7 +418,7 @@ stays frozen at the original 10 so the regime analysis remains reproducible.
   and `contexto=CONTEXTO`. Do not re-add per-reactor fits: the evidence is in "Scope" above.
 - Older analysis cells still select the dataset by commenting/uncommenting a block of
   `df = df_crystallizerN_xxx.copy()` lines. Match that style when adding cells there.
-- **68 rows, 31 positives across the three reactors — but C3 alone has 6.** Treat any single F2
+- **64 rows, 36 positives across the three reactors — but C3 alone has 9 (3 of them iron-silent plug leaks).** Treat any single F2
   number as noise; differences between models/treatments need repeated CV or an interval, not one
   split. `avaliar_cv_com_grid` sizes `SMOTE(k_neighbors=...)` from the minority count **per CV
   fold** (`floor(n * (n_splits-1) / n_splits) - 1`), not from the whole training set, and disables
@@ -388,11 +440,10 @@ markdown of each section, keep it there):
 - **Clustering sliding windows** (kept in the notebook as evidence, not as a model): with log1p +
   `RobustScaler` and `k` by silhouette, the winner (k=2) is degenerate — 99.6 % of windows in one
   cluster with lift **0.97**. Across every `k`, the high-lift cluster is 0.1–0.4 % of the time and
-  covers **1 failure of 31** (lift rises 8.9 → 26.7, coverage stays at 3.2 %). The only operationally
-  useful regime shows up at k=4 — lift **3.27**, 22.6 % of failures in 6.9 % of the time — but its
-  signature is just *high iron* (mean max 19 ppm), a threshold in disguise, and it still loses to
-  the cross-reactor margin (5.3–6.9×). `clusterizar_regimes` reports `lift_util` (best lift among
-  clusters covering ≥20 % of failures) precisely so this is visible instead of the flattering number.
+  covers **1 failure of 36** (lift rises 7.5 → 22.4, coverage stays at 2.7 %). On the 36-base the
+  `lift_util` column (best lift among clusters covering ≥20 % of failures) stays **below 1.0 at
+  every k** — no regime with useful coverage beats chance. (On the 31-base a k=4 regime reached
+  lift 3.3; it did not survive the rescued, iron-silent failures.)
 - **IsolationForest on event rows** (`otimizar_avaliar_iforest`, `rodar_iforest`,
   `plotar_resultados_iforest`): circular (the event table was already built by selecting
   exceedances) and a 108-combination grid over 59 rows. Rerun over the sliding windows it gets real
@@ -408,19 +459,19 @@ markdown of each section, keep it there):
 
 | Finding | Measurement |
 |---|---|
-| **Cross-reactor margin** = daily median − median of the three | lift **5.3×** (>1.2) and **6.9×** (>1.6) at the 31 failure anchors, vs 3.7× for daily median > 5 ppm at equal or lower base rate |
+| **Cross-reactor margin** = daily median − median of the three | lift **4.5×** (>1.2) and **5.8×** (>1.6) at the 36 failure anchors, vs 3.1× for daily median > 5 ppm at equal or lower base rate |
 | C1–C2 daily medians correlate **0.76**, C3 only **0.11** (other train); common component is **6 %** of variance | so "the whole plant rose" is the exception, and reactor identity matters |
 | **Rolling 365-day p99** as the limit | detector F2 **0.239** vs 0.230 for the fixed 3.5 ppm, with 95 vs 104 false positives, and drift-proof |
-| **Campaign age**, exposure-normalised | peak at **1–2 years (3.91 failures / 1000 reactor-days)** vs 0.73 above 5 years — non-monotonic, so it enters as a **band**, not a linear term |
+| **Campaign age**, exposure-normalised | on the corrected campaigns + 36-base the profile is ~flat for the first 5 years (**2.5–3.1 failures / 1000 reactor-days**) then drops ~4× (**0.72**) — still non-monotonic, so it enters as a **band**, not a linear term |
 | **Window support** varies 8 → 150 samples | now a feature (`n_amostras_*`, `maior_lacuna_*`) and a hard filter in the sliding windows (371 of 5340 anchors dropped) |
 
-**The new rule to beat** (`avaliar_detector_composto`, in `comparar_detectores`):
+**The new rule to beat** (`avaliar_detector_composto`, in `comparar_detectores`, 36-base):
 `max diário > 20 ppm` **OR** (`mediana diária > 3.0` **AND** `margem > 0.6`) →
-**VP 11, FP 70, precision 0.136, recall 0.355, F2 0.268**, against the incumbent `max > 5`
-(VP 8, FP 171, precision 0.045, recall 0.258, F2 0.132) — +38 % recall with 59 % fewer false alarms.
+**VP 12, FP 69, precision 0.148, recall 0.333, F2 0.267**, against the incumbent `max > 5`
+(VP 8, FP 171, precision 0.045, recall 0.222, F2 0.124) — +50 % recall with 60 % fewer false alarms.
 Both branches are needed: the median branch misses C3 23/11/2013 (264 ppm in a single sample never
 moves a daily median), the max branch misses the sustained elevations.
-**These thresholds were chosen looking at the same 31 failures** — it is the starting point for the
+**These thresholds were chosen looking at the same failures** — it is the starting point for the
 supervised stage to validate on the temporal split, not a validated result.
 
 ## Validation stage — the results that redirect the project (10/08/2026)
@@ -428,68 +479,71 @@ supervised stage to validate on the temporal split, not a validated result.
 Everything here is measured; the notebook section "Validação" reproduces it.
 
 **1. The label is confounded with time, and that explains most earlier results.**
-**28 of the 31 failures (90 %) happen up to 2018**: the rate falls from 3.95 failures per 1000
-reactor-days in 2016–2018 to **0.30** in 2019–2021. Iron drifts down over the same period
+**30 of the 36 failures (83 %) happen up to 2018**: the rate falls from 4.26 failures per 1000
+reactor-days in 2016–2018 to **0.30** in 2019–2021, with a partial return (1.52) in 2022–2024
+made of the audit-rescued C3 plug leaks. Iron drifts down over the same period
 (Kendall tau ≈ **−0.29**, p ~1e-160 on all three reactors, Sen slope ≈ **−0.05 ppm/year**,
 median 2.45–2.50 → 1.80–1.90 ppm). Iron and failures fall together without one causing the
 other, so **any feature correlated with time looks predictive without predicting anything**.
 `avaliar_valor_features` reports `AUC_ajustada` (AUC recomputed inside 3-year blocks, weighted
 by positives) precisely to expose this.
 
-**2. Feature value, before and after adjusting for era** (4969 windows, 149 positive):
+**2. Feature value, before and after adjusting for era** (4969 windows, ~175 positive, 36-base):
 
 | Feature | AUC | AUC adjusted | Reading |
 |---|---|---|---|
-| `mediana` | 0.678 | **0.524** | the "best feature" was mostly a clock |
-| `p90` | 0.655 | **0.541** | idem |
-| `razao_max` | 0.384 | **0.487** | the apparent inversion was the drift |
-| `idade_campanha` | 0.448 | **0.588** | flips sign and becomes the strongest |
-| `faixa_campanha` | 0.451 | **0.586** | idem |
-| `posto_medio` / `frac_lider` | 0.418 / 0.571 | **0.416 / 0.572** | stable — cross-reactor rank carries real signal |
-| `cusum_rel` | 0.562 | **0.567** | stable — the control chart as a feature |
-| `margem_media` | 0.568 | **0.565** | stable |
-| `densidade_relativa` / `n_amostras` | 0.395 / 0.396 | 0.421 / 0.431 | sampling thins out before a stop |
-| `n_reparos_vidro_campanha` | 0.449 | **0.559** | also flips under adjustment — more glass repairs in the campaign, more risk |
+| `mediana` | 0.627 | **0.507** | the "best feature" was mostly a clock |
+| `p90` | 0.606 | **0.517** | idem |
+| `razao_max` | 0.375 | **0.451** | the apparent inversion was the drift |
+| `dias_desde_ultimo_reparo` | 0.521 | **0.567** | flips and becomes the strongest: recent repair, higher risk |
+| `cusum_rel` | 0.552 | **0.556** | stable — the control chart as a feature |
+| `margem_media` | 0.546 | **0.544** | stable |
+| `idade_campanha` | 0.430 | **0.536** | still flips under adjustment, weaker than on the 31-base |
+| `n_reparos_vidro_campanha` | 0.449 | **0.532** | more glass repairs in the campaign, more risk |
+| `densidade_relativa` | 0.391 | **0.414** | stable: sampling thins out before a stop |
+| `assimetria` / `curtose` | 0.382 / 0.418 | **0.417 / 0.417** | stable: the pre-failure window has a different shape |
 
-No single feature exceeds **0.59** adjusted AUC. Note `margem_max` has adjusted AUC 0.519 but
-lift **6.9×** at threshold 1.6 — AUC measures average separation, lift measures the tail; the
+No single feature exceeds **0.57** adjusted AUC. Note `margem_max` has adjusted AUC 0.515 but
+lift **5.8×** at threshold 1.6 — AUC measures average separation, lift measures the tail; the
 margin does not distinguish the ordinary day, it distinguishes the extreme one.
 
 **3. The supervised evaluation was broken and, once fixed, the models lose.** The old single
 split cuts on the positives' quantile and **inverts the prevalence** (unified: 24 pos / 6 neg in
 train, 7 / 21 in test) — hence recall 1.00 in 11 of 12 ablations with precision equal to the test
-base rate. Under expanding-window temporal CV the pattern is: fold 1 F2 **0.976** (test block is
-89 % positive), folds 2–3 F2 **0.0–0.42** (test blocks 12 % and 22 % positive), F2 std ≈ 0.5 —
-larger than any difference between models, so LogReg/RF/XGB are indistinguishable here.
-Evaluated as a **detector** on the same out-of-time test period:
+base rate. Under expanding-window temporal CV the pattern is prevalence-driven: fold 1 F2 **0.978**
+(test block 90 % positive — artefact), later folds swing 0.0–0.87 on 9-to-10-row test blocks,
+F2 std 0.2–0.5 — of the order of any difference between models, so model ranking here is noise.
+Evaluated as a **detector** on the same out-of-time test period (36-base, 3 folds, 13 failures):
 
 | Rule | VP | FP | precision | recall | F2 |
 |---|---|---|---|---|---|
-| composite (20 / 3.5 / 0.9) | 3 | 11 | 0.214 | 0.300 | **0.278** |
-| composite (20 / 3.0 / 0.6) | 3 | 18 | 0.143 | 0.300 | 0.246 |
-| supervised model (quantile 0.90) | 2 | 33 | 0.057 | 0.200 | 0.133 |
-| incumbent (`max > 5`) | 2 | 42 | 0.045 | 0.200 | 0.119 |
+| composite (20 / 3.5 / 0.9) | 3 | 19 | 0.136 | 0.231 | **0.203** |
+| composite (20 / 3.0 / 0.6) | 3 | 28 | 0.097 | 0.231 | 0.181 |
+| supervised model (quantile 0.90) | 3 | 48 | 0.059 | 0.231 | 0.146 |
+| incumbent (`max > 5`) | 2 | 64 | 0.030 | 0.154 | 0.085 |
 | supervised model (quantiles 0.95/0.98/0.99) | 0 | 5/0/0 | 0.000 | 0.000 | 0.000 |
 
-**The rule beats the model.** The model only ties the incumbent at its most permissive threshold
-and vanishes at the selective ones — it cannot put the pre-failure windows at the top of the
-ranking. With 31 positives, 90 % of them in one era, and a univariate series, the model has more
+**The rule beats the model.** The model matches the composite's recall only at its most permissive
+threshold, at 2.5× the false alarms, and vanishes at the selective ones — it cannot put the
+pre-failure windows at the top of the ranking. With 36 positives, 84 % of them in one era, and a univariate series, the model has more
 degrees of freedom than the data supports.
 
-**4. The composite rule out of sample.**
-- **Temporal holdout is inconclusive by lack of data**: after 01/01/2019 there are **3 failures**
-  and no rule catches any of them (the incumbent fires 86 false alarms in the same period). This
-  is not evidence the rule fails — it is evidence this base cannot validate temporally.
+**4. The composite rule out of sample (36-base).**
+- **Temporal holdout hardened, and that is information**: after 01/01/2019 there are now
+  **6 failures** (the audit doubled them) and no rule catches any (the incumbent fires 86 false
+  alarms in the period). The post-2019 failures are plug leaks and found-at-inspection modes that
+  **release little iron** — not just lack of power, but a physical limit of the signal that
+  bounds the product's scope.
 - **Leave-one-reactor-out says the signal is C3's**: with thresholds fitted on the other two,
-  C3 gets recall **0.833** (5 of 6) and F2 **0.431**, against C1 0.182 / 0.175 and C2 0.071 /
-  0.068. This lines up with everything else — both iron-triggered emergency stops are C3, and C3
-  is the reactor from the other train (correlation 0.11 with the others).
-- **Bootstrap (500 resamples of the failures)**: F2 = 0.264, 95 % CI **[0.150, 0.381]** — the
-  lower bound is still above the incumbent's 0.132, but the interval is wide.
+  C3 gets recall **0.556** (5 of 9 — the 5 classic lining failures; the 3 rescued plug leaks are
+  iron-silent) and F2 **0.357**, against C1 0.182 / 0.179 and C2 0.062 / 0.062. Both
+  iron-triggered emergency stops are C3, and C3 is the reactor from the other train.
+- **Bootstrap (500 resamples of the failures)**: F2 = 0.256, 95 % CI **[0.156, 0.363]** — the
+  lower bound stays above the incumbent's 0.122, but the interval is wide.
 
-**5. Lead time exists, partially.** The composite rule fires for **15 of 31** failures within
-60 days, median lead **3.0 days** (p25 0.5, p75 21.5, max 40); 11 failures with ≥1 day and
-**7 with ≥7 days**. Better than the 0.0 median of the raw thresholds. The honest product is
+**5. Lead time exists, partially.** The composite rule fires for **17 of 36** failures within
+60 days, median lead **3.0 days** (p25 1.0, p75 23.0, max 39); 13 failures with ≥1 day and
+**8 with ≥7 days**. Better than the 0.0 median of the raw thresholds. The honest product is
 *"partial anticipation + cheaper confirmation with fewer false alarms"*, not "failure prediction".
 
 **6. Operating point by cost** (`sensibilidade_custo`): up to ~5:1 (cost of a missed failure over
@@ -505,51 +559,152 @@ below was measured, not assumed:
 |---|---|---|
 | Loading, cleaning, distributional EDA | **unify** | iron distributions are statistically identical: Kruskal-Wallis η² = 0.0008; medians 2.2 / 2.3 / 2.3 ppm; p99 = 4.3 on all three |
 | Feature construction | **unify (mandatory)** | the best feature (cross-reactor margin, and `posto`) only exists with the three series together |
-| Fitting (model and thresholds) | **unify** | `comparar_escopo_treino`: C3 — the reactor where signal exists — has 6 failures and learns better from the *other two* (PR-AUC lift 4.83) than from itself (1.56); no scope wins on all three |
-| Alarm calibration | **per reactor** | `calibrar_limiares_por_reator`: same rule structure, different cut points — C3 keeps recall 0.833 with **16 instead of 29** false alarms; C2 goes from F2 0.118 to 0.183; C1 unchanged (global was already its optimum) |
-| Evaluation and reporting | **per reactor, always** | the aggregate hides that the rule works on C3 (recall 0.83) and fails on C2 (0.21) |
+| Fitting (model and thresholds) | **unify** | `comparar_escopo_treino` (36-base): "own reactor" wins nowhere; unified wins C1 (lift 3.79) and C2 (1.32), and C3 learns best from the *other two* (3.47 vs 1.15 from itself) |
+| Alarm calibration | **~~per reactor~~ → single fixed rule** | in-sample calibration looks better (F2 0.323 vs 0.267) but **fails walk-forward validation** (0.159 vs 0.229) — see "Rule optimisation" below. Report per reactor, calibrate globally |
+| Evaluation and reporting | **per reactor, always** | the aggregate hides that the rule works on C3 and fails on C2 |
 
 Reactor identity as a model feature does **not** help (PR-AUC 0.041 with vs 0.047 without).
 
-**Per-reactor performance with calibrated thresholds** (`resumo_por_reator`; the totals are
-VP 13 / FP 60 / F2 **0.330**, against 11 / 70 / 0.268 for a single threshold and 8 / 171 / 0.132
-for the incumbent):
+**Per-reactor performance with calibrated thresholds** (`resumo_por_reator`, 36-failure base; the
+totals are VP 14 / FP 59 / F2 **0.323**, against 12 / 69 / 0.267 for a single threshold and
+8 / 171 / 0.124 for the incumbent):
 
 | Reactor | Failures | Responds to | Thresholds (max/median/margin) | VP | FP | recall | F2 | Alarmed ≤60 d | Median lead |
 |---|---|---|---|---|---|---|---|---|---|
 | C1 | 11 | margin | 30 / 2.5 / 0.6 | 5 | 21 | 0.455 | 0.357 | 4/11 | **15.0 d** |
-| C2 | 14 | level | 20 / 3.0 / 0.6 | 3 | 23 | 0.214 | 0.183 | 6/14 | 12.5 d |
-| C3 | 6 | margin | 30 / 3.5 / 0.9 | 5 | 16 | **0.833** | **0.556** | 5/6 | 1.0 d |
+| C2 | 16 | margin | 20 / 3.0 / 0.6 | 4 | 22 | 0.250 | 0.222 | 7/16 | 2.0 d |
+| C3 | 9 | margin | 30 / 3.5 / 0.9 | 5 | 16 | **0.556** | **0.439** | 6/9 | 2.0 d |
 
-Per-reactor lift makes the asymmetry concrete: daily median > 3.5 has lift 6.17 on C3 and 1.42 on
-C1; margin > 1.2 has lift 12.24 on C1 and 2.58 on C2. **Each reactor responds to a different
-statistic**, which is exactly why a single threshold is suboptimal.
+Per-reactor lift makes the asymmetry concrete: daily median > 3.5 has lift 4.11 on C3 and 1.30 on
+C1; margin > 1.2 has lift 11.22 on C1 and 2.26 on C2. **Each reactor responds to a different
+statistic**, which is exactly why a single threshold is suboptimal. C3's 4 misses include the 3
+audit-rescued plug leaks (2023–2024), which release no measurable iron — the rule's real scope is
+**shell-lining failures**, and on those C3 catches 5 of 5 with signal.
 
 **Why C2 probably is not a modelling problem.** Its stop descriptions are dominated by agitator and
 nozzle failures (*"quebra dos parafusos da pá superior do Hidro#1"*, *"Dano na Hélice"*,
 *"vazamento pela região do selo/mesa"*), not shell-lining failures — iron in the liquor has no
-reason to rise in those modes. C2 has **0 iron mentions and 1 reactor swap in 14 stops**; C3 has
-2 mentions and 1 swap in 6. The fix is a **failure-mode classification from the plant** (a column
-to add to `ficha_eventos_para_validacao`), not a different algorithm.
+reason to rise in those modes. C2 has **0 iron mentions in 16 stops**; C3 has 2 in 9. The fix is a
+**failure-mode classification from the plant** (a column to add to
+`ficha_eventos_para_validacao`), not a different algorithm.
+
+## Rule optimisation — the thresholds are already optimal, and calibrating hurts (11/08/2026)
+
+Asked whether the deployed thresholds were optimal, the answer is **yes, within the noise of this
+sample** — and the search that proved it also overturned the per-reactor calibration.
+
+**Setup.** The old calibration used a 4×4×4 = 64-combination grid and **two of the three reactors
+picked a grid-edge value** (`limite_max = 30`, the ceiling) — an edge optimum is the limit of the
+search, not an optimum. `GRADE_REGRA_AMPLA` widens it to 11×10×10 = **1100 combinations per
+reactor** and adds `inf` (branch off) / `-inf` (condition always true), so the search itself can
+discover a dead branch. The evaluation runs on integer day arrays (`preparar_arrays_regra`,
+`_metricas_dias`), reproducing `_metricas_alarmes` exactly (verified VP/FP-identical) at ~1 s for
+the whole analysis instead of minutes.
+
+**1. The values in use are optimal within noise.** Gains from the 17× larger grid: C1 **+0.005**,
+C2 **+0.021**, C3 **−0.015** (its value in use *is* the argmax). For scale, the 27 grid neighbours
+of the operating point span F2 0.21–0.28 — the available gains are smaller than the grid's own
+wobble. The global single rule ranks **50th of 1100** (top 4.5 %).
+
+**2. The `max` branch is largely dead weight.** On C1 it never fires (F2 identical at
+`limite_max` = 40, 60 or `inf`, because no C1 day exceeds that); the whole rule there is
+mediana+margem. Globally, turning the branch off (`inf`) gives the same VP/FP as the best result.
+It still earns its place on C3, where the two branches are complementary (2–3 failures each alone,
+5 together). **Correction to an earlier claim in this repo:** the `max` branch was justified by
+saying the median branch would miss C3 23/11/2013 (264 ppm in one sample; that day's median is
+only 2.95 and margin 0.00). That is wrong — the alarm window is 15 days and another day in it
+fires the median branch.
+
+**3. The margin is what makes the rule work.** Ablation with calibrated thresholds:
+
+| Reactor | full rule | max branch only | median+margin only | median only (no margin) |
+|---|---|---|---|---|
+| C1 | **0.362** | 0.000 (never fires) | **0.362** | 0.000 (0 VP, 60 FP) |
+| C2 | **0.243** | 0.067 | 0.208 | 0.152 |
+| C3 | **0.424** | 0.244 | 0.254 | 0.227 |
+
+**4. Per-reactor calibration does not survive validation — this reverses the earlier
+recommendation.** Walk-forward (calibrate on the past of each cut, measure on the next block;
+reference rules measured on the *same* test slices):
+
+| Rule | VP | FP | precision | recall | F2 out-of-sample |
+|---|---|---|---|---|---|
+| **fixed composite (20 / 3.0 / 0.6)** | 9 | 52 | 0.148 | 0.265 | **0.229** |
+| simplified (median>2.75 AND margin>0.6) | 8 | 56 | 0.125 | 0.235 | 0.200 |
+| **calibrated per reactor on the past** | 6 | 46 | 0.115 | 0.176 | **0.159** |
+| margin only (> 0.8) | 5 | 38 | 0.116 | 0.147 | 0.140 |
+| incumbent (`max > 5`) | 7 | 138 | 0.048 | 0.206 | 0.124 |
+
+And performance decays **monotonically with the number of estimated parameters**
+(`comparar_estrategias_calibracao`, same time cuts for all): 0 params **0.273**, 3 params
+0.23–0.24, 9 params 0.213. The calibration's optimism is large — mean training F2 **0.51** against
+**0.16** on test (C2: 0.46 → 0.06; C3: 0.67 → 0.21).
+
+**Caveat that must travel with this table:** the "fixed" row has a built-in advantage — 20/3.0/0.6
+was itself chosen looking at the whole series. The honest reading is "**no evidence that
+calibrating helps, and evidence that it hurts**", not "0.229 is guaranteed".
+
+**Consequence for the deliverable:** ship **one rule for all three reactors**, keep the reporting
+per reactor (the C1/C2/C3 asymmetry is real), and do not touch the thresholds with the current
+data — the grid has been swept end to end. What unlocks the next gain is more labelled events and
+the failure-mode classification, not a better ppm number.
+
+## Failure mode — what iron can physically see (11/08/2026)
+
+Iron only rises when the glass lining breaks and exposes carbon steel to the liquor. Agitator
+failures without steel exposure, external leaks through a gasket/seal, and leaks in a tantalum plug
+repair (a tiny area) have no reason to move the reading — demanding that the detector anticipate
+them is measuring against an impossible denominator. Two cuts were tested with the delivery rule
+(20/3.0/0.6) on all 36 failures:
+
+| Denominator | failures | VP | recall | F2 |
+|---|---|---|---|---|
+| **all** | 36 | 12 | 0.333 | **0.267** |
+| emergency stops only | 18 | 8 | **0.444** | 0.268 |
+| found in scheduled inspection only | 16 | 4 | 0.250 | 0.146 |
+| lining/shell only (text proxy) | 17 | 8 | **0.471** | 0.276 |
+| modes where iron is physically plausible | 24 | 9 | 0.375 | 0.259 |
+
+**Recall rises to 0.44–0.47; F2 does not move.** The arithmetic reason matters: restricting the
+denominator **removes no false alarm** — the detector fires exactly as often, only the count of
+"failures it was supposed to catch" changes. This **corrects an expectation written earlier in this
+repo** ("filtering to lining failures makes the measured performance rise") — recall rises, overall
+performance does not. Two consequences: the declared scope improves the *promise*, not the product;
+and the mode classification is still worth asking the plant for, but because it defines the alarm's
+**contractual scope**, not because it will lift F2.
+
+`classificar_modo_falha` reads OCORRIMENTO + OBSERVAÇÕES (what happened) and deliberately **not**
+SERVIÇOS EXECUTADOS (what was done) — installing a plug is the *repair* for a hole, not the failure
+mode; ignoring that classified 21 of 36 failures as "plug", including the two stops the sheet
+attributes to iron. It is a **proxy, not a verdict**: `CORRECOES_MODO_FALHA` carries the two
+documented overrides (C3 23/11/2013 and 02/08/2018, whose OCORRIMENTO describes the iron trigger
+rather than the damage), and `ModoFalha` now travels in `ficha_eventos_para_validacao` for the
+plant to correct.
+
+**Operational load, the number the plant feels:** the delivery rule produces 69 false alarms over
+~15 years and 3 reactors = **1.5 per reactor per year**, against 171 = **3.8 per reactor per year**
+for the incumbent 5 ppm rule.
 
 ## Open gaps — what still needs analysis
 
 1. **The 5 ppm rule carries almost no information — but iron does.** The control that settles it
    (`avaliar_baseline_lift`, in the notebook's "Baseline" section): compare the fraction of failure
    windows meeting a criterion against the same fraction over 2000 random windows per reactor.
-   Over the 31 anchored failures, 15-day windows, after `limpar_excursoes`:
+   Over the 36 anchored failures, 15-day windows, after `limpar_excursoes`:
 
    | Criterion | In failure windows | Base rate | Lift |
    |---|---|---|---|
-   | max > 5 ppm (incumbent) | 25.8 % | 23.2 % | **1.11×** |
-   | max > 7 ppm | 25.8 % | 9.9 % | **2.60×** |
-   | max > 10 ppm | 22.6 % | 5.5 % | **4.11×** |
-   | max > 20 ppm | 12.9 % | 2.1 % | **6.24×** |
-   | daily median ≥ 3.5 ppm | 35.5 % | 16.3 % | **2.18×** |
-   | daily median ≥ 4.0 ppm | 22.6 % | 8.2 % | **2.75×** |
+   | max > 5 ppm (incumbent) | 21.6 % | 23.2 % | **0.93×** |
+   | max > 7 ppm | 21.6 % | 9.9 % | **2.18×** |
+   | max > 10 ppm | 18.9 % | 5.5 % | **3.45×** |
+   | max > 20 ppm | 10.8 % | 2.1 % | **5.22×** |
+   | daily median ≥ 3.5 ppm | 29.7 % | 16.3 % | **1.82×** |
+   | daily median ≥ 4.0 ppm | 18.9 % | 8.2 % | **2.30×** |
 
-   At 60 days the incumbent rule drops to **0.89×** — *below* base rate, which is why an apparent
-   "33.5-day median lead time" at 5 ppm is an artefact. The incumbent rule does not fail because
+   On the audited 36-failure base the incumbent rule falls **below base rate even at 15 days**
+   (it was 1.11× on the 31-base — the rescued failures are iron-silent and dilute every level
+   criterion). At 60 days it drops to **0.84×**, which is why an apparent "33.5-day median lead
+   time" at 5 ppm is an artefact. The incumbent rule does not fail because
    iron is uninformative; it fails because the threshold sits where the signal is buried. Every
    comparison should be against this table, not against zero. (These figures are the ones measured
    after isolated high readings stopped being deleted — the earlier `max > 20 ppm` lift of 10.6×
@@ -570,7 +725,8 @@ to add to `ficha_eventos_para_validacao`), not a different algorithm.
    but is off), and time since the previous sample at the anchor.
 4b. **The alarm statistic is wrong — addressed by the composite rule** (see "Unsupervised stage";
    `comparar_detectores` prints the full table in the notebook).
-   `avaliar_detector_diario` over the 31 anchored failures
+   `avaliar_detector_diario` over the anchored failures (measured on the 31-failure base;
+   the notebook recomputes on 36)
    (alarm = daily statistic above the limit, grouped at 15 days, hit if the failure follows within
    15 days):
 
@@ -592,8 +748,8 @@ to add to `ficha_eventos_para_validacao`), not a different algorithm.
    filtered out.
 5. **Window quality — closed.** Sliding windows drop anchors with fewer than 8 samples (371 of
    5340) and `n_amostras_*` / `maior_lacuna_15d` are model features. `auditar_janelas_eventos`
-   audits the event table itself: over the 31 anchored failures **none** falls below 8 samples
-   (median 79, min 19, max 148) — the "2 samples in 15 days" case was the R3 2020 record, which
+   audits the event table itself: over the 36 anchored failures **none** falls below 8 samples
+   (median 83, min 15, max 153) — the "2 samples in 15 days" case was the R3 2020 record, which
    the plant-stop filter already removes.
 6. **Stationarity — closed, and it matters more than expected.** `testar_tendencia`: Kendall tau
    −0.288/−0.293/−0.298 with p ~1e-157 to 1e-186, Sen slope ≈ −0.05 ppm/year, daily median
@@ -603,20 +759,22 @@ to add to `ficha_eventos_para_validacao`), not a different algorithm.
    baseline is no longer hand-picked: `calcular_ewma_rolante` uses a rolling median + robust
    IQR-based scale (ADF is not run: statsmodels is not installed, and the question here is
    monotonic trend, not unit root).
-7. **Lead time — answered, and it is partial.** Raw thresholds: 5 ppm fires for 15/31 with a median
-   lead of 33.5 days (noise — see the base rate above), while 7 ppm fires for 9/31, 10 ppm for 7/31
-   and 20 ppm for 4/31, all with median lead **0.0 days** — those fire on the very last measurement
-   before the stop, i.e. iron above ~7 ppm is the *trigger*, not a precursor. The **composite rule**
-   does better: `lead_time_regra` gives 15/31 alarmed within 60 days, median lead **3.0 days**
-   (p25 0.5, p75 21.5, max 40), 11 failures with ≥1 day and **7 with ≥7 days**. So there is usable
-   anticipation for roughly a quarter of the failures and none for the rest — report it as this
-   distribution, never as a mean.
+7. **Lead time — answered, and it is partial.** Raw thresholds fire on the very last measurement
+   before the stop (median lead **0.0 days** at 7/10/20 ppm on the 31-base analysis) — iron above
+   ~7 ppm is the *trigger*, not a precursor; the apparent 33.5-day lead at 5 ppm is base-rate noise.
+   The **composite rule** does better: on the 36-base, `lead_time_regra` gives 17/36 alarmed within
+   60 days, median lead **3.0 days** (p25 1.0, p75 23.0, max 40), 13 failures with ≥1 day and
+   **8 with ≥7 days**. Usable anticipation exists for roughly a fifth of the failures and none for
+   the rest — report it as this distribution, never as a mean.
 8. **What is genuinely still open.** (a) The temporal holdout cannot be run with 3 post-2019
    failures — either the plant supplies more recent labelled events or the claim stays scoped to
    2011–2018. (b) The C1/C2 vs C3 asymmetry needs a process explanation from the plant (different
    train, different duty?) before the rule is deployed plant-wide. (c) The event dates still need
    the plant's confirmation — `ficha_eventos_para_validacao` produces the sheet to send (60
-   records: 31 used as failures, 21 not failures, 8 dropped as plant stops).
+   records: 36 used as failures, 17 not failures, 6 dropped as plant stops). The sheet's
+   "DATA ANCORADA NA SÉRIE DE FERRO" column is already filled and is the authoritative anchor;
+   what still needs the plant is the **failure-mode classification** and a fix for the one
+   mistyped anchor (C1 2016 → 2018).
 
 ## Known traps
 

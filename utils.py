@@ -370,6 +370,23 @@ ARQUIVO_INSPECOES = "Vitrificados do PIA - Dados de inspeção.xlsx"
 # Tag do equipamento -> nome do crystallizer usado no resto do estudo
 TAG_CRYSTALLIZER = {"30-151": "C1", "30-251": "C2", "30-351": "C3"}
 
+# Correções pontuais da planilha, aplicadas em carregar_inspecoes. Cada entrada existe
+# porque o texto da planilha não permite inferir o marcador com regex segura, mas outra
+# fonte (ou o contexto) estabelece o fato. Formato: (Crystallizer, data, campo, valor, fonte).
+CORRECOES_INSPECAO = [
+    # A planilha registra só "Reinstalação de plug", mas a linha do tempo do próprio deck
+    # da equipe Bayer chama este evento de "Vazamento no plug do reparo" (18/10/2024).
+    # A âncora na série cai em 20/10 — 2 dias da data do deck, 2 da planilha.
+    ("C3", "2024-10-22", "Vazamento", True,
+     "deck Bayer: 'Vazamento no plug do reparo' em 18/10/2024"),
+    # "o reator (com o revestimento vitrificado novo) foi instalado devido a furo..." —
+    # é uma troca de reator, mas o padrão 'reator ... instalado' não é seguro como regex
+    # (colide com 'plug instalado no local do furo do reator'). Pré-série; só afeta a
+    # idade de campanha do C2 no início da década de 2010.
+    ("C2", "2009-03-15", "TrocaDoReator", True,
+     "texto: 'o reator ... foi instalado devido a furo no revestimento'"),
+]
+
 
 def _normalizar_cabecalho(valor):
     """Normaliza o nome da coluna: sem acento, sem plural, minusculo."""
@@ -378,8 +395,11 @@ def _normalizar_cabecalho(valor):
     txt = unicodedata.normalize("NFKD", str(valor)).encode("ascii", "ignore").decode()
     txt = re.sub(r"[^a-z ]", " ", txt.lower())
     txt = re.sub(r"\s+", " ", txt).strip()
-    # as abas alternam entre singular e plural
-    return {"tipos de inspecao": "tipo de inspecao", "observacao": "observacoes"}.get(txt, txt)
+    # as abas alternam entre singular e plural; a coluna de âncora manual pode vir
+    # com variações de texto
+    return {"tipos de inspecao": "tipo de inspecao", "observacao": "observacoes",
+            "data ancorada na serie de ferro": "data ancorada",
+            "data ancorada na serie": "data ancorada"}.get(txt, txt)
 
 
 def _parse_data_inspecao(valor, ano):
@@ -462,6 +482,10 @@ def carregar_inspecoes(arquivo=None):
                 ano_corrente = int(reg["ano"])
 
             inicio, fim = _parse_data_inspecao(reg.get("data"), ano_corrente)
+            # "DATA ANCORADA NA SÉRIE DE FERRO": âncora definida à mão na planilha
+            # (validação da planta). Quando preenchida, tem precedência sobre a
+            # reancoragem automática — ver ajustar_eventos_para_lacunas.
+            ancora_manual, _ = _parse_data_inspecao(reg.get("data ancorada"), ano_corrente)
             linhas.append({
                 "Crystallizer": crystallizer,
                 "Tag":          ws.title,
@@ -469,6 +493,7 @@ def carregar_inspecoes(arquivo=None):
                 "DataTexto":    "" if reg.get("data") is None else str(reg["data"]),
                 "Inicio":       inicio,
                 "Fim":          fim,
+                "DataAncoradaManual": ancora_manual,
                 "Tipo":         str(reg.get("tipo de inspecao") or "").strip(),
                 "Substituido":  str(reg.get("substituido") or "").strip(),
                 "ReparoVidro":  str(reg.get("reparo vidro") or "").strip(),
@@ -481,20 +506,39 @@ def carregar_inspecoes(arquivo=None):
     df = pd.DataFrame(linhas)
 
     texto = (df["Tipo"] + " " + df["Ocorrimento"] + " " + df["Observacoes"] + " " + df["Servicos"]).str.lower()
-    df["Emergencia"]    = texto.str.contains(r"emerg|n[ãa]o programad", regex=True)
+    # 'emeg[êe]ncia' cobre o erro de digitação da planilha (C1 2009: "Parada de emegência")
+    df["Emergencia"]    = texto.str.contains(r"emerg|emeg[êe]ncia|n[ãa]o programad", regex=True)
     df["Programada"]    = texto.str.contains(r"programad|preventiv|tempo de opera|tempo de vida|vida [uú]til", regex=True)
-    df["Vazamento"]     = texto.str.contains(r"vazamento|furo|trinca|quebra|perfura", regex=True)
+    # 'poro passante' / 'até a parte metálica' = vidro rompido até o aço — é a condição
+    # que expõe ferro ao licor, mesmo quando encontrada em inspeção programada (C1 2015).
+    # 'infiltraç' cobre reparo existente vazando (C3 2024).
+    df["Vazamento"]     = texto.str.contains(
+        r"vazamento|furo|trinca|quebra|perfura|poro passante|"
+        r"at[ée] a parte met[áa]lica|infiltra[çc]", regex=True)
+    # 'substituir o reator' / 'substituído o reator' cobrem as trocas registradas em
+    # voz ativa (C2 2012: "R.I. ... para substituir o reator"; C2 2016: "Substituido o reator")
     df["TrocaDoReator"] = texto.str.contains(
         r"substitui[çc][ãa]o do reator|equipamento novo|reator novo|troca do reator|"
-        r"substitui[çc][ãa]o do equipamento|equipamento substitu[íi]do|pelo spare", regex=True)
+        r"substitui[çc][ãa]o do equipamento|equipamento substitu[íi]do|pelo spare|"
+        r"substituir o reator|substitu[íi]do o reator", regex=True)
     df["FerroCitado"]   = texto.str.contains("ferro")
-    df["Falha"]         = df["Emergencia"] | df["Vazamento"] | df["TrocaDoReator"]
+
+    # Correções documentadas (ver CORRECOES_INSPECAO no topo da seção)
+    df["Corrigido"] = False
+    for cryst, data, campo, valor, _fonte in CORRECOES_INSPECAO:
+        m = (df["Crystallizer"] == cryst) & (df["Inicio"] == pd.Timestamp(data))
+        df.loc[m, campo] = valor
+        df.loc[m, "Corrigido"] = True
+
+    df["Falha"] = df["Emergencia"] | df["Vazamento"] | df["TrocaDoReator"]
 
     return df.sort_values(["Crystallizer", "Inicio"]).reset_index(drop=True)
 
 
 def ajustar_eventos_para_lacunas(df_eventos, map_medicoes, dias_lacuna=2,
-                                 coluna_ts="Inicio", incluir_ultima_medicao=True):
+                                 coluna_ts="Inicio", incluir_ultima_medicao=True,
+                                 tolerancia_ancora_seg=300, max_desvio_ancora_dias=180,
+                                 verbose=True):
     """Reancora os eventos que caem dentro de uma lacuna de amostragem.
 
     Quando o reator para, a amostragem para junto: o apontamento da planilha
@@ -502,21 +546,95 @@ def ajustar_eventos_para_lacunas(df_eventos, map_medicoes, dias_lacuna=2,
     deslocado para a última medição anterior à lacuna, de modo que a janela
     `[ts - dias, ts)` cubra os dados que realmente antecedem a parada.
 
+    **Âncora manual tem precedência.** Se a linha traz `DataAncoradaManual`
+    (coluna "DATA ANCORADA NA SÉRIE DE FERRO" da planilha — a âncora validada
+    pela planta), ela define a âncora do evento. A planilha registra o timestamp
+    da **própria medição**, truncado ao minuto (54 das 56 âncoras batem com uma
+    amostra a menos de 60 s), então:
+
+      - se existe uma medição a menos de `tolerancia_ancora_seg` da data
+        informada, o evento é ancorado **um segundo depois dessa medição** — ela
+        é a amostra que disparou a parada e precisa cair dentro da janela
+        `[ts - dias, ts)`;
+      - se a célula traz só a data (00:00) ou uma hora que não corresponde a
+        nenhuma medição, usa-se a última medição **até o fim daquele dia**.
+
+    A reancoragem automática vira apenas o fallback das linhas sem âncora manual
+    (célula vazia, "-" ou "Fora do Período da Série").
+
     map_medicoes           : {crystallizer: df_medicoes}
     dias_lacuna            : intervalo entre medições consecutivas a partir do
                              qual o trecho é considerado lacuna
     incluir_ultima_medicao : se True, ancora um segundo depois da última medição,
                              para que ela entre na janela (é a amostra que
                              costuma disparar a parada)
+    tolerancia_ancora_seg  : distância máxima para casar a âncora manual com uma
+                             medição (padrão 300 s, absorve o truncamento ao minuto)
+    max_desvio_ancora_dias : guarda contra erro de digitação — âncora manual a mais
+                             de N dias da data do apontamento é ignorada (cai no
+                             automático) e reportada. O maior desvio legítimo
+                             observado é de 41 dias (evento constatado em parada de
+                             planta), então 180 é folga confortável.
 
-    Acrescenta as colunas TS_Ajustado, Deslocado, DiasDeslocado e LacunaDias.
+    Acrescenta as colunas TS_Ajustado, Deslocado, DiasDeslocado, LacunaDias,
+    AncoraManual, AncoraCasouMedicao e AncoraRejeitada.
     """
     df = df_eventos.copy()
-    ajustados, deslocados, dias_desl, lacunas = [], [], [], []
+    ajustados, deslocados, dias_desl, lacunas, manuais, casou = [], [], [], [], [], []
+    rejeitadas, avisos = [], []
 
     for _, ev in df.iterrows():
         ts = ev[coluna_ts]
         med = map_medicoes.get(ev["Crystallizer"])
+        manual = ev.get("DataAncoradaManual", None)
+
+        # guarda de sanidade: âncora absurdamente longe da data do apontamento
+        rejeitada = False
+        if (manual is not None and pd.notna(manual) and pd.notna(ts)
+                and abs((pd.Timestamp(manual) - ts).days) > max_desvio_ancora_dias):
+            avisos.append(f"    {ev['Crystallizer']} DATA={ts:%Y-%m-%d} "
+                          f"ANCORADA={pd.Timestamp(manual):%Y-%m-%d} "
+                          f"({(pd.Timestamp(manual) - ts).days:+d} dias) — ignorada")
+            manual, rejeitada = None, True
+        rejeitadas.append(rejeitada)
+
+        # --- âncora manual da planilha: precedência total ---
+        if manual is not None and pd.notna(manual) and med is not None and not med.empty:
+            alvo = pd.Timestamp(manual)
+            marcos = med["TIMESTAMP"].values
+            i = np.searchsorted(marcos, np.datetime64(alvo), side="left")
+
+            prox, dist = None, None
+            for j in (i - 1, i):
+                if 0 <= j < len(marcos):
+                    t = pd.Timestamp(marcos[j])
+                    d = abs((t - alvo).total_seconds())
+                    if dist is None or d < dist:
+                        prox, dist = t, d
+
+            if prox is not None and dist <= tolerancia_ancora_seg:
+                novo = prox + pd.Timedelta(seconds=1) if incluir_ultima_medicao else prox
+                casou.append(True)
+            else:
+                # só a data, sem hora útil: última medição até o fim daquele dia
+                fim_do_dia = alvo.normalize() + pd.Timedelta(days=1)
+                i_prev = np.searchsorted(marcos, np.datetime64(fim_do_dia), side="left") - 1
+                if i_prev >= 0:
+                    t_prev = pd.Timestamp(marcos[i_prev])
+                    novo = t_prev + pd.Timedelta(seconds=1) if incluir_ultima_medicao else t_prev
+                else:  # âncora anterior ao início da série — usa a data como veio
+                    novo = alvo
+                casou.append(False)
+
+            ajustados.append(novo)
+            deslocados.append(pd.notna(ts) and abs((novo - ts).total_seconds()) > 86400)
+            dias_desl.append((ts - novo).total_seconds() / 86400 if pd.notna(ts) else np.nan)
+            lacunas.append(np.nan)
+            manuais.append(True)
+            continue
+
+        manuais.append(False)
+        casou.append(False)
 
         if pd.isna(ts) or med is None or med.empty:
             ajustados.append(ts); deslocados.append(False)
@@ -546,10 +664,21 @@ def ajustar_eventos_para_lacunas(df_eventos, map_medicoes, dias_lacuna=2,
             ajustados.append(ts); deslocados.append(False)
             dias_desl.append(0.0); lacunas.append(lacuna)
 
-    df["TS_Ajustado"]   = ajustados
-    df["Deslocado"]     = deslocados
-    df["DiasDeslocado"] = dias_desl
-    df["LacunaDias"]    = lacunas
+    df["TS_Ajustado"]        = ajustados
+    df["Deslocado"]          = deslocados
+    df["DiasDeslocado"]      = dias_desl
+    df["LacunaDias"]         = lacunas
+    df["AncoraManual"]       = manuais
+    df["AncoraCasouMedicao"] = casou
+    df["AncoraRejeitada"]    = rejeitadas
+
+    if verbose and avisos:
+        print(f"  ATENÇÃO: {len(avisos)} âncora(s) manual(is) a mais de "
+              f"{max_desvio_ancora_dias} dias do apontamento — provável erro de digitação "
+              f"na planilha. Foram ignoradas (usou-se a reancoragem automática):")
+        for a in avisos:
+            print(a)
+
     return df
 
 # =============================================================================
@@ -699,18 +828,29 @@ def montar_tabela_eventos(inspecoes, map_medicoes, paradas_planta=None,
     Etapas:
       1. reancora os apontamentos que caem dentro de uma lacuna de amostragem
          (`ajustar_eventos_para_lacunas`);
-      2. marca os que caem numa parada de planta;
-      3. mantém apenas os apontamentos que são falha de equipamento;
+      2. marca os que caem numa parada de planta (lacuna simultânea nos 3 reatores);
+      3. mantém os apontamentos que são falha de equipamento. Em parada de planta a
+         regra é seletiva: **dano físico real (`Vazamento`) é resgatado** — o furo
+         encontrado na abertura existia antes da parada, então a última janela de
+         operação é o lugar certo para procurar sinal — enquanto troca SEM dano
+         (preventiva/spare, ex.: C3 05/2020) continua fora, porque ali a janela
+         anterior descreve operação normal antes de uma parada programada;
       4. funde apontamentos do mesmo reator a menos de `fundir_dias` dias — a
          planilha frequentemente registra a mesma parada em duas linhas.
 
-    Retorna a tabela completa com a coluna `Selecionado` marcando as falhas que
-    devem ser usadas como positivos.
+    Colunas de saída além das da planilha:
+      Selecionado        — entra como positivo no estudo
+      DescobertoEmParada — resgatado do filtro de parada de planta (âncora recua
+                           para a última medição antes da parada; janela íntegra,
+                           mas a DATA da falha é incerta — foi constatada na abertura)
+      TipoFalha          — 'emergência' | 'constatada em parada de planta' |
+                           'constatada/programada' (como a falha foi encontrada)
     """
     if paradas_planta is None:
         paradas_planta = identificar_paradas_de_planta(map_medicoes)
 
-    df = ajustar_eventos_para_lacunas(inspecoes, map_medicoes, dias_lacuna=dias_lacuna)
+    df = ajustar_eventos_para_lacunas(inspecoes, map_medicoes, dias_lacuna=dias_lacuna,
+                                      verbose=verbose)
 
     inicio_serie = min(m["TIMESTAMP"].min() for m in map_medicoes.values())
     df["NoPeriodo"] = df["Inicio"] >= inicio_serie
@@ -719,23 +859,46 @@ def montar_tabela_eventos(inspecoes, map_medicoes, paradas_planta=None,
         for ts in df["Inicio"]
     ]
 
-    candidatos = df["NoPeriodo"] & df["Falha"] & ~df["LacunaDePlanta"]
+    candidatos = df["NoPeriodo"] & df["Falha"] & (~df["LacunaDePlanta"] | df["Vazamento"])
 
-    # funde apontamentos consecutivos do mesmo reator
+    # Funde apontamentos consecutivos do mesmo reator. Os marcadores do registro
+    # absorvido são propagados para o que fica (OR): a planilha costuma separar a
+    # constatação da parada de emergência em duas linhas, e sem isso o evento
+    # sobrevivente perderia o rótulo "emergência" só por ser o mais antigo dos dois.
     df["Selecionado"] = False
+    df["ApontamentosFundidos"] = 0
     for cryst in df["Crystallizer"].unique():
         sel = df[candidatos & (df["Crystallizer"] == cryst)].sort_values("TS_Ajustado")
-        ultimo = None
+        ultimo, i_mantido = None, None
         for i, linha in sel.iterrows():
             if ultimo is None or (linha["TS_Ajustado"] - ultimo).days > fundir_dias:
                 df.loc[i, "Selecionado"] = True
+                i_mantido = i
+            elif i_mantido is not None:
+                for col in ("Emergencia", "Vazamento", "TrocaDoReator", "FerroCitado"):
+                    df.loc[i_mantido, col] = bool(df.loc[i_mantido, col]) or bool(linha[col])
+                df.loc[i_mantido, "ApontamentosFundidos"] += 1
             ultimo = linha["TS_Ajustado"]
 
+    df["DescobertoEmParada"] = df["Selecionado"] & df["LacunaDePlanta"]
+    df["TipoFalha"] = np.where(~df["Selecionado"], "",
+                      np.where(df["Emergencia"], "emergência",
+                      np.where(df["DescobertoEmParada"], "constatada em parada de planta",
+                               "constatada/programada")))
+
     if verbose:
+        descartadas_pp = int((df["NoPeriodo"] & df["Falha"] & df["LacunaDePlanta"]
+                              & ~df["Selecionado"]).sum())
         print(f"Apontamentos na planilha            : {len(df)}")
         print(f"  dentro do período da série        : {int(df['NoPeriodo'].sum())}")
-        print(f"  reancorados por cair em lacuna    : {int((df['NoPeriodo'] & df['Deslocado']).sum())}")
-        print(f"  em parada de planta (descartados) : {int((df['NoPeriodo'] & df['LacunaDePlanta']).sum())}")
+        n_man = int((df["NoPeriodo"] & df["AncoraManual"]).sum())
+        n_casou = int((df["NoPeriodo"] & df["AncoraManual"] & df["AncoraCasouMedicao"]).sum())
+        print(f"  com âncora manual da planilha     : {n_man}"
+              f"  ({n_casou} casaram com uma medição; coluna 'DATA ANCORADA NA SÉRIE DE FERRO')")
+        print(f"  reancorados por cair em lacuna    : {int((df['NoPeriodo'] & df['Deslocado'] & ~df['AncoraManual']).sum())}")
+        print(f"  em parada de planta               : {int((df['NoPeriodo'] & df['LacunaDePlanta']).sum())}"
+              f"  (resgatadas com dano físico: {int(df['DescobertoEmParada'].sum())}, "
+              f"descartadas: {descartadas_pp})")
         print(f"  falhas selecionadas               : {int(df['Selecionado'].sum())}")
         print()
         print(df[df["Selecionado"]].groupby("Crystallizer").agg(
@@ -743,6 +906,7 @@ def montar_tabela_eventos(inspecoes, map_medicoes, paradas_planta=None,
             emergencia=("Emergencia", "sum"),
             troca_reator=("TrocaDoReator", "sum"),
             cita_ferro=("FerroCitado", "sum"),
+            em_parada=("DescobertoEmParada", "sum"),
         ).to_string())
 
     return df
@@ -2183,11 +2347,22 @@ def avaliar_lift_series(map_series, df_ancoras_base, df_ancoras_falha, limiares,
 # Idade de campanha (tempo desde a última troca do reator)
 # -----------------------------------------------------------------------------
 
-def campanhas_por_reator(df_inspecoes):
-    """{crystallizer: [datas de troca]} a partir da planilha de inspeção."""
+def campanhas_por_reator(df_inspecoes, fundir_dias=7):
+    """{crystallizer: [datas de troca]} a partir da planilha de inspeção.
+
+    Trocas a menos de `fundir_dias` de distância contam como uma só — a planilha
+    registra a mesma troca em duas linhas (C1 26/06/2013 aparece duas vezes;
+    C1 18 e 21/07/2017 são o evento e a inspeção pós-troca).
+    """
     trocas = df_inspecoes[df_inspecoes["TrocaDoReator"]]
-    return {c: sorted(pd.to_datetime(g["Inicio"].dropna()))
-            for c, g in trocas.groupby("Crystallizer")}
+    campanhas = {}
+    for c, g in trocas.groupby("Crystallizer"):
+        datas, dedup = sorted(pd.to_datetime(g["Inicio"].dropna())), []
+        for d in datas:
+            if not dedup or (d - dedup[-1]).days > fundir_dias:
+                dedup.append(d)
+        campanhas[c] = dedup
+    return campanhas
 
 
 def idade_campanha(campanhas, cryst, ts):
@@ -3652,9 +3827,11 @@ def ficha_eventos_para_validacao(df_inspecoes, map_medicoes, janela_dias=15,
     deslocamento aplicado, o motivo do deslocamento e o suporte de amostra — para a planta
     validar linha a linha.
     """
-    cols = ["Crystallizer", "Inicio", "TS_Ajustado", "Deslocado", "DiasDeslocado",
-            "LacunaDias", "LacunaDePlanta", "Selecionado", "Falha", "Emergencia",
-            "TrocaDoReator", "FerroCitado", "Ocorrimento"]
+    cols = ["Crystallizer", "Inicio", "DataAncoradaManual", "TS_Ajustado", "AncoraManual",
+            "Deslocado", "DiasDeslocado", "LacunaDias", "LacunaDePlanta", "Selecionado",
+            "Falha", "Emergencia", "TrocaDoReator", "FerroCitado", "TipoFalha",
+            "DescobertoEmParada", "Corrigido", "ModoFalha", "FerroPlausivel",
+            "ModoCorrigido", "Ocorrimento"]
     disponiveis = [c for c in cols if c in df_inspecoes.columns]
     df = df_inspecoes[df_inspecoes["NoPeriodo"]][disponiveis].copy() \
         if "NoPeriodo" in df_inspecoes.columns else df_inspecoes[disponiveis].copy()
@@ -3827,9 +4004,9 @@ def comparar_escopo_treino(df_janelas, colunas=None, n_cortes=3, modelo=None,
     tabela = pd.DataFrame(linhas)
     if verbose:
         print(tabela.to_string(index=False))
-        print("\nLeitura: nenhum escopo vence em todos os reatores, e o C3 — o único com sinal "
-              "forte — aprende melhor com os OUTROS dois do que consigo mesmo (só 6 falhas). "
-              "Treinar por reator não se sustenta; o ajuste fica unificado.")
+        print("\nLeitura: nenhum escopo vence em todos os reatores, e 'próprio' não vence em "
+              "nenhum — o C3, o único com sinal forte, aprende melhor com os OUTROS dois do que "
+              "consigo mesmo. Treinar por reator não se sustenta; o ajuste fica unificado.")
     return tabela
 
 
@@ -3992,3 +4169,687 @@ def resumo_por_reator(map_medicoes, map_falhas, df_janelas=None, margem=None,
         print("\nSem linha 'total' de propósito: a média entre reatores esconde que a regra "
               "funciona em um e falha em outro, que é justamente o que decide a implantação.")
     return tabela
+
+
+# =============================================================================
+# Otimização da regra de detecção: grade ampla, platô e validação walk-forward
+# =============================================================================
+#
+# Motivo desta seção: a calibração original usava uma grade de 4x4x4 = 64 combinações
+# e DOIS dos três reatores escolheram o valor da BORDA (limite_max = 30, o teto da
+# grade). Quando o ótimo encosta na borda, ele não é ótimo — é o limite da busca. Além
+# disso, escolher o argmax de F2 sobre 9 a 16 falhas por reator é otimização sobre
+# ruído: o número que sai é um teto otimista, não desempenho esperado.
+#
+# O que esta seção acrescenta:
+#   1. grade AMPLA e mais fina, incluindo o valor "desligado" (`inf` no limite de max ou
+#      de mediana desliga aquele ramo; `-inf` na margem desliga a condição de margem) —
+#      assim a própria busca descobre se um ramo da regra é peso morto;
+#   2. avaliação RÁPIDA (arrays de dias, sem pandas no laço), porque a grade cresce de
+#      64 para ~900 combinações por reator;
+#   3. análise de PLATÔ: em vez do pico isolado, escolhe-se o ponto mais estável entre
+#      os limiares que empatam dentro da tolerância — o pico isolado é a assinatura
+#      clássica de sobreajuste;
+#   4. validação WALK-FORWARD: calibra no passado, mede no bloco seguinte. É a única
+#      estimativa honesta do procedimento "calibrar limiar com o histórico".
+
+GRADE_REGRA_AMPLA = {
+    "limite_max":     [5, 7, 10, 12, 15, 20, 25, 30, 40, 60, np.inf],
+    "limite_mediana": [2.0, 2.25, 2.5, 2.75, 3.0, 3.25, 3.5, 4.0, 5.0, np.inf],
+    "limite_margem":  [-np.inf, 0.0, 0.15, 0.3, 0.45, 0.6, 0.75, 0.9, 1.2, 1.6],
+}
+
+
+def _dias_int(indice):
+    """Índice de datas -> número inteiro de dias (para aritmética rápida)."""
+    return indice.values.astype("datetime64[D]").astype(np.int64)
+
+
+def preparar_arrays_regra(map_medicoes, margem, coluna=COLUNA_FE):
+    """Pré-calcula, por reator, os arrays diários usados na busca em grade.
+
+    Sem isso cada combinação recalcularia `serie_diaria` — o que torna uma grade de
+    900 combinações inviável.
+    """
+    diario_max = serie_diaria(map_medicoes, "max", coluna)
+    diario_med = serie_diaria(map_medicoes, "median", coluna)
+    arrays = {}
+    for cryst in map_medicoes:
+        s_max = diario_max[cryst].dropna()
+        s_med = diario_med[cryst].dropna()
+        s_mar = margem[cryst].dropna()
+        # alinha os três no mesmo eixo de dias
+        idx = s_max.index.union(s_med.index).union(s_mar.index)
+        arrays[cryst] = {
+            "dias": _dias_int(idx),
+            "max": s_max.reindex(idx).values.astype(float),
+            "med": s_med.reindex(idx).values.astype(float),
+            "mar": s_mar.reindex(idx).values.astype(float),
+        }
+    return arrays
+
+
+def _metricas_dias(dias_alarme, dias_falha, janela_alarme=15, agrupar_dias=15,
+                   dias_neutros=None):
+    """VP/FP/precisão/recall/F2 a partir de vetores de dias (inteiros).
+
+    Replica exatamente a convenção de `_metricas_alarmes`: alarmes separados por até
+    `agrupar_dias` do alarme ANTERIOR contam como um só (agrupamento por silêncio), e
+    o acerto vale se a falha ocorre em até `janela_alarme` dias depois do alarme.
+    """
+    total = len(dias_falha)
+    if len(dias_alarme) == 0:
+        return {"VP": 0, "FP": 0, "precisao": 0.0, "recall": 0.0, "F2": 0.0}
+
+    a = np.sort(dias_alarme)
+    novo = np.empty(len(a), dtype=bool)
+    novo[0] = True
+    if len(a) > 1:
+        novo[1:] = np.diff(a) > agrupar_dias
+    a = a[novo]
+
+    f = np.sort(dias_falha)
+    if total:
+        lo = np.searchsorted(a, f - janela_alarme, side="left")
+        hi = np.searchsorted(a, f, side="right")
+        vp = int((hi > lo).sum())
+    else:
+        vp = 0
+
+    lo = np.searchsorted(f, a, side="left")
+    hi = np.searchsorted(f, a + janela_alarme, side="right")
+    sem_acerto = hi <= lo
+    # alarme perto de uma falha fora do escopo não é falso positivo: ele acertou algo
+    # real, apenas de um modo de falha que não está sendo avaliado
+    if dias_neutros is not None and len(dias_neutros):
+        n = np.sort(np.asarray(dias_neutros))
+        lo_n = np.searchsorted(n, a, side="left")
+        hi_n = np.searchsorted(n, a + janela_alarme, side="right")
+        sem_acerto = sem_acerto & (hi_n <= lo_n)
+    fp = int(sem_acerto.sum())
+
+    precisao = vp / (vp + fp) if vp + fp else 0.0
+    recall = vp / total if total else 0.0
+    f2 = 5 * precisao * recall / (4 * precisao + recall) if precisao + recall else 0.0
+    return {"VP": vp, "FP": fp, "precisao": round(precisao, 4),
+            "recall": round(recall, 4), "F2": round(f2, 4)}
+
+
+def _dias_alarme_regra(arr, lmax, lmed, lmar, mascara=None):
+    """Dias em que a regra composta dispara, dado o dicionário de arrays de um reator."""
+    disp = (arr["max"] > lmax) | ((arr["med"] > lmed) & (arr["mar"] > lmar))
+    disp = np.nan_to_num(disp, nan=False)
+    if mascara is not None:
+        disp = disp & mascara
+    return arr["dias"][disp]
+
+
+def _mascara_periodos(dias, periodos):
+    if periodos is None:
+        return None
+    m = np.zeros(len(dias), dtype=bool)
+    for ini, fim in periodos:
+        m |= (dias >= _dias_int(pd.DatetimeIndex([ini]))[0]) & \
+             (dias <= _dias_int(pd.DatetimeIndex([fim]))[0])
+    return m
+
+
+def buscar_grade_regra(arr, dias_falha, grade=None, janela_alarme=15, agrupar_dias=15,
+                       mascara=None):
+    """Varre a grade inteira para UM reator e devolve um DataFrame com todas as métricas."""
+    grade = grade or GRADE_REGRA_AMPLA
+    linhas = []
+    for lmax in grade["limite_max"]:
+        for lmed in grade["limite_mediana"]:
+            for lmar in grade["limite_margem"]:
+                d = _dias_alarme_regra(arr, lmax, lmed, lmar, mascara)
+                m = _metricas_dias(d, dias_falha, janela_alarme, agrupar_dias)
+                linhas.append({"limite_max": lmax, "limite_mediana": lmed,
+                               "limite_margem": lmar, **m})
+    return pd.DataFrame(linhas)
+
+
+def _escolha_estavel(df_grade, grade, metrica="F2", tolerancia=0.02):
+    """Entre os limiares que empatam dentro da tolerância, escolhe o mais ESTÁVEL.
+
+    Estabilidade = média da métrica na vizinhança do ponto na grade (±1 posição em cada
+    eixo). Um pico isolado cercado de valores ruins é sobreajuste; um ponto no meio de
+    um platô sobrevive a pequenas mudanças de limiar — e é o que se implanta.
+    """
+    eixos = ["limite_max", "limite_mediana", "limite_margem"]
+    pos = {e: {v: i for i, v in enumerate(grade[e])} for e in eixos}
+    chave = {}
+    for _, r in df_grade.iterrows():
+        chave[(pos["limite_max"][r["limite_max"]],
+               pos["limite_mediana"][r["limite_mediana"]],
+               pos["limite_margem"][r["limite_margem"]])] = r[metrica]
+
+    melhor = df_grade[metrica].max()
+    plato = df_grade[df_grade[metrica] >= melhor - tolerancia].copy()
+
+    vizinhanca = []
+    for _, r in plato.iterrows():
+        i = (pos["limite_max"][r["limite_max"]],
+             pos["limite_mediana"][r["limite_mediana"]],
+             pos["limite_margem"][r["limite_margem"]])
+        vals = []
+        for di in (-1, 0, 1):
+            for dj in (-1, 0, 1):
+                for dk in (-1, 0, 1):
+                    v = chave.get((i[0] + di, i[1] + dj, i[2] + dk))
+                    if v is not None:
+                        vals.append(v)
+        vizinhanca.append(np.mean(vals))
+    plato["estabilidade"] = vizinhanca
+    plato = plato.sort_values(["estabilidade", metrica, "precisao"], ascending=False)
+    return plato
+
+
+def otimizar_regra_por_reator(map_medicoes, map_falhas, margem=None, grade=None,
+                              metrica="F2", tolerancia_plato=0.02, janela_alarme=15,
+                              agrupar_dias=15, coluna=COLUNA_FE, verbose=True):
+    """Busca em grade ampla, por reator, com análise de platô.
+
+    Devolve, para cada reator: o argmax da métrica, a escolha ESTÁVEL (topo do platô) e
+    a grade completa para inspeção da superfície. A escolha estável é a recomendada
+    para implantação — ver `_escolha_estavel`.
+    """
+    grade = grade or GRADE_REGRA_AMPLA
+    if margem is None:
+        _, _, margem = calcular_margem_cross_reator(map_medicoes, coluna, verbose=False)
+    arrays = preparar_arrays_regra(map_medicoes, margem, coluna)
+
+    resultado = {}
+    for cryst in map_medicoes:
+        dias_falha = _dias_int(pd.DatetimeIndex(map_falhas[cryst]["TIMESTAMP"]))
+        g = buscar_grade_regra(arrays[cryst], dias_falha, grade, janela_alarme, agrupar_dias)
+        argmax = g.loc[g[metrica].idxmax()]
+        plato = _escolha_estavel(g, grade, metrica, tolerancia_plato)
+        estavel = plato.iloc[0]
+        resultado[cryst] = {"grade": g, "argmax": argmax, "plato": plato,
+                            "estavel": estavel, "n_plato": len(plato),
+                            "n_falhas": len(dias_falha)}
+
+    if verbose:
+        linhas = []
+        for cryst, r in resultado.items():
+            a, e = r["argmax"], r["estavel"]
+            linhas.append({
+                "reator": cryst, "falhas": r["n_falhas"],
+                "argmax (max/med/margem)": f"{a.limite_max}/{a.limite_mediana}/{a.limite_margem}",
+                f"{metrica}_argmax": a[metrica],
+                "escolha estável": f"{e.limite_max}/{e.limite_mediana}/{e.limite_margem}",
+                f"{metrica}_estável": e[metrica], "VP": int(e.VP), "FP": int(e.FP),
+                "combos no platô": r["n_plato"],
+            })
+        print(pd.DataFrame(linhas).to_string(index=False))
+        print(f"\nGrade: {len(grade['limite_max'])}x{len(grade['limite_mediana'])}"
+              f"x{len(grade['limite_margem'])} = "
+              f"{len(grade['limite_max']) * len(grade['limite_mediana']) * len(grade['limite_margem'])}"
+              f" combinações por reator.")
+        print("`inf` no limite de max ou de mediana significa RAMO DESLIGADO; -inf na margem "
+              "significa condição de margem sempre verdadeira.")
+        print("A 'escolha estável' é o topo do platô (melhor média na vizinhança da grade), "
+              "não o pico isolado — é ela que deve ir para implantação.")
+    return resultado
+
+
+def limiares_da_otimizacao(resultado, usar="estavel"):
+    """Extrai {reator: (lmax, lmed, lmar)} do resultado de `otimizar_regra_por_reator`."""
+    return {c: (r[usar]["limite_max"], r[usar]["limite_mediana"], r[usar]["limite_margem"])
+            for c, r in resultado.items()}
+
+
+def sensibilidade_limiares(resultado, cryst, metrica="F2", verbose=True):
+    """Como a métrica responde a cada limiar isoladamente, fixando os outros dois no ótimo.
+
+    Responde à pergunta prática: "se eu mexer um pouco neste número, quanto perco?"
+    """
+    r = resultado[cryst]
+    e = r["estavel"]
+    g = r["grade"]
+    saida = {}
+    for eixo, fixos in [("limite_max", ["limite_mediana", "limite_margem"]),
+                        ("limite_mediana", ["limite_max", "limite_margem"]),
+                        ("limite_margem", ["limite_max", "limite_mediana"])]:
+        sel = g
+        for f in fixos:
+            sel = sel[sel[f] == e[f]]
+        saida[eixo] = sel[[eixo, "VP", "FP", "precisao", "recall", metrica]] \
+            .sort_values(eixo).reset_index(drop=True)
+    if verbose:
+        print(f"{cryst} — limiares no ponto estável: max>{e.limite_max}, "
+              f"mediana>{e.limite_mediana}, margem>{e.limite_margem} "
+              f"({metrica} {e[metrica]:.3f})")
+        for eixo, tab in saida.items():
+            print(f"\n  variando {eixo} (os outros dois fixos):")
+            print("   " + tab.to_string(index=False).replace("\n", "\n   "))
+    return saida
+
+
+REFERENCIAS_REGRA = {
+    # a regra vigente cabe na mesma família: só o ramo do máximo, em 5 ppm
+    "regra vigente (max > 5)":     (5, np.inf, -np.inf),
+    "composta fixa (20/3.0/0.6)":  (20, 3.0, 0.6),
+    "simplificada (mediana>2.75 E margem>0.6)": (np.inf, 2.75, 0.6),
+    "margem fixa (> 0.8)":         (np.inf, -np.inf, 0.8),
+}
+
+
+def validar_calibracao_walkforward(map_medicoes, map_falhas, margem=None, grade=None,
+                                   n_blocos=3, metrica="F2", janela_alarme=15,
+                                   agrupar_dias=15, referencias=None,
+                                   coluna=COLUNA_FE, verbose=True):
+    """Calibra no passado, mede no bloco seguinte — a estimativa honesta do procedimento.
+
+    O F2 in-sample de uma grade de centenas de combinações sobre ~10 falhas por reator é
+    um teto, não uma previsão. Aqui o limiar é escolhido usando SÓ o passado de cada
+    corte e aplicado ao bloco seguinte, nunca visto. O agregado dos blocos é o que se
+    pode prometer para a operação.
+
+    Devolve a tabela por reator/bloco e o consolidado por reator.
+    """
+    grade = grade or GRADE_REGRA_AMPLA
+    if margem is None:
+        _, _, margem = calcular_margem_cross_reator(map_medicoes, coluna, verbose=False)
+    arrays = preparar_arrays_regra(map_medicoes, margem, coluna)
+
+    linhas = []
+    for cryst in map_medicoes:
+        ts_falhas = pd.DatetimeIndex(map_falhas[cryst]["TIMESTAMP"]).sort_values()
+        if len(ts_falhas) < n_blocos + 1:
+            continue
+        arr = arrays[cryst]
+        dias_todos = arr["dias"]
+        cortes = [ts_falhas[int(len(ts_falhas) * (i + 1) / (n_blocos + 1))]
+                  for i in range(n_blocos)]
+
+        for i, corte in enumerate(cortes):
+            fim = cortes[i + 1] if i + 1 < len(cortes) else pd.Timestamp(
+                dias_todos.max(), unit="D") + pd.Timedelta(days=1)
+            d_corte = _dias_int(pd.DatetimeIndex([corte]))[0]
+            d_fim = _dias_int(pd.DatetimeIndex([fim]))[0]
+
+            m_treino = dias_todos < d_corte
+            m_teste = (dias_todos >= d_corte) & (dias_todos <= d_fim)
+            df_f = _dias_int(ts_falhas)
+            f_treino = df_f[df_f < d_corte]
+            f_teste = df_f[(df_f >= d_corte) & (df_f <= d_fim)]
+            if len(f_treino) < 2 or len(f_teste) < 1:
+                continue
+
+            g = buscar_grade_regra(arr, f_treino, grade, janela_alarme, agrupar_dias,
+                                   mascara=m_treino)
+            plato = _escolha_estavel(g, grade, metrica)
+            e = plato.iloc[0]
+            d_alarme = _dias_alarme_regra(arr, e.limite_max, e.limite_mediana,
+                                          e.limite_margem, m_teste)
+            m_out = _metricas_dias(d_alarme, f_teste, janela_alarme, agrupar_dias)
+            linhas.append({"reator": cryst, "bloco": i + 1, "corte": corte.date(),
+                           "regra": "calibrada no passado",
+                           "limiares": f"{e.limite_max}/{e.limite_mediana}/{e.limite_margem}",
+                           f"{metrica}_treino": e[metrica], "falhas_teste": len(f_teste),
+                           **m_out})
+
+            # mesmas fatias de teste, regras de referência (limiar fixo, sem calibração)
+            for nome, (a, b, c) in (referencias or REFERENCIAS_REGRA).items():
+                d_ref = _dias_alarme_regra(arr, a, b, c, m_teste)
+                m_ref = _metricas_dias(d_ref, f_teste, janela_alarme, agrupar_dias)
+                linhas.append({"reator": cryst, "bloco": i + 1, "corte": corte.date(),
+                               "regra": nome, "limiares": f"{a}/{b}/{c}",
+                               f"{metrica}_treino": np.nan, "falhas_teste": len(f_teste),
+                               **m_ref})
+
+    df = pd.DataFrame(linhas)
+    if df.empty:
+        print("Amostra insuficiente para walk-forward.")
+        return df, pd.DataFrame()
+
+    def _consolida(chaves):
+        r = (df.groupby(chaves)
+             .agg(blocos=("bloco", "size"), falhas_teste=("falhas_teste", "sum"),
+                  VP=("VP", "sum"), FP=("FP", "sum"),
+                  F2_treino_medio=(f"{metrica}_treino", "mean"))
+             .reset_index())
+        r["precisao"] = (r["VP"] / (r["VP"] + r["FP"]).replace(0, np.nan)).fillna(0).round(3)
+        r["recall"] = (r["VP"] / r["falhas_teste"].replace(0, np.nan)).fillna(0).round(3)
+        r["F2_fora_da_amostra"] = (
+            5 * r["precisao"] * r["recall"] /
+            (4 * r["precisao"] + r["recall"]).replace(0, np.nan)).fillna(0).round(3)
+        return r
+
+    resumo = _consolida(["reator", "regra"])
+    resumo["otimismo"] = (resumo["F2_treino_medio"] - resumo["F2_fora_da_amostra"]).round(3)
+    consolidado = _consolida(["regra"]).sort_values("F2_fora_da_amostra", ascending=False)
+
+    if verbose:
+        print(df.to_string(index=False))
+        print("\nPor reator e regra (VP/FP somados sobre os blocos de teste):")
+        print(resumo.to_string(index=False))
+        print("\nConsolidado nos três reatores — a comparação que decide:")
+        print(consolidado.to_string(index=False))
+        print("\n`otimismo` = F2 in-sample menos F2 fora da amostra: o quanto a calibração "
+              "promete a mais do que entrega. As linhas de referência não são calibradas, "
+              "então são medidas nas MESMAS fatias de teste sem nenhuma vantagem informacional.")
+    return df, resumo, consolidado
+
+
+def ablacao_ramos_regra(map_medicoes, map_falhas, limiares_por_reator, margem=None,
+                        janela_alarme=15, agrupar_dias=15, coluna=COLUNA_FE, verbose=True):
+    """Qual ramo da regra carrega o resultado em cada reator?
+
+    Compara a regra completa com cada ramo isolado, usando os limiares calibrados. Se um
+    ramo sozinho empata com a regra completa, o outro é peso morto naquele equipamento —
+    e simplificar a regra é ganho de implantação, não perda.
+    """
+    if margem is None:
+        _, _, margem = calcular_margem_cross_reator(map_medicoes, coluna, verbose=False)
+    arrays = preparar_arrays_regra(map_medicoes, margem, coluna)
+
+    linhas = []
+    for cryst in map_medicoes:
+        lmax, lmed, lmar = limiares_por_reator[cryst]
+        arr = arrays[cryst]
+        dias_falha = _dias_int(pd.DatetimeIndex(map_falhas[cryst]["TIMESTAMP"]))
+        variantes = {
+            "regra completa": (lmax, lmed, lmar),
+            "só o ramo do máximo": (lmax, np.inf, lmar),
+            "só o ramo mediana+margem": (np.inf, lmed, lmar),
+            "só mediana (sem margem)": (np.inf, lmed, -np.inf),
+        }
+        for nome, (a, b, c) in variantes.items():
+            d = _dias_alarme_regra(arr, a, b, c)
+            m = _metricas_dias(d, dias_falha, janela_alarme, agrupar_dias)
+            linhas.append({"reator": cryst, "variante": nome,
+                           "limiares": f"{a}/{b}/{c}", **m})
+    df = pd.DataFrame(linhas)
+    if verbose:
+        print(df.to_string(index=False))
+    return df
+
+
+def _dias_falha_por_reator(map_falhas):
+    return {c: _dias_int(pd.DatetimeIndex(df["TIMESTAMP"])) for c, df in map_falhas.items()}
+
+
+def comparar_estrategias_calibracao(map_medicoes, map_falhas, margem=None, grade=None,
+                                    base=(20, 3.0, 0.6), n_blocos=3, metrica="F2",
+                                    janela_alarme=15, agrupar_dias=15, coluna=COLUNA_FE,
+                                    verbose=True):
+    """Quantos graus de liberdade esta base sustenta na calibração dos limiares?
+
+    Todas as estratégias são medidas por WALK-FORWARD com os MESMOS cortes de tempo
+    (definidos sobre as falhas dos três reatores juntos), então a comparação é limpa:
+
+      - `fixa`                  — nenhum parâmetro estimado do histórico (o limiar `base`);
+      - `só margem (por reator)`— 1 parâmetro por reator, os outros dois fixos;
+      - `só mediana (por reator)`— idem, na mediana;
+      - `3 params (global)`     — 3 parâmetros estimados, mas com os três reatores juntos;
+      - `3 params (por reator)` — 3 parâmetros por reator = 9 no total.
+
+    Quanto mais parâmetros, melhor o ajuste no passado e — se a amostra não sustentar —
+    pior o desempenho no futuro. Esta função mede exatamente essa troca.
+    """
+    grade = grade or GRADE_REGRA_AMPLA
+    if margem is None:
+        _, _, margem = calcular_margem_cross_reator(map_medicoes, coluna, verbose=False)
+    arrays = preparar_arrays_regra(map_medicoes, margem, coluna)
+    dias_falha = _dias_falha_por_reator(map_falhas)
+
+    todas = np.sort(np.concatenate([v for v in dias_falha.values()]))
+    cortes = [todas[int(len(todas) * (i + 1) / (n_blocos + 1))] for i in range(n_blocos)]
+
+    def _melhor(grade_local, mascaras, dias_treino, pooled):
+        """Escolhe limiares maximizando a métrica no treino (pooled ou por reator)."""
+        melhor, valor = None, -1
+        for lmax in grade_local["limite_max"]:
+            for lmed in grade_local["limite_mediana"]:
+                for lmar in grade_local["limite_margem"]:
+                    vp = fp = tot = 0
+                    for c in pooled:
+                        d = _dias_alarme_regra(arrays[c], lmax, lmed, lmar, mascaras[c])
+                        m = _metricas_dias(d, dias_treino[c], janela_alarme, agrupar_dias)
+                        vp += m["VP"]; fp += m["FP"]; tot += len(dias_treino[c])
+                    p = vp / (vp + fp) if vp + fp else 0.0
+                    r = vp / tot if tot else 0.0
+                    f2 = 5 * p * r / (4 * p + r) if p + r else 0.0
+                    if f2 > valor:
+                        valor, melhor = f2, (lmax, lmed, lmar)
+        return melhor, valor
+
+    g_margem = {"limite_max": [base[0]], "limite_mediana": [base[1]],
+                "limite_margem": grade["limite_margem"]}
+    g_mediana = {"limite_max": [base[0]], "limite_mediana": grade["limite_mediana"],
+                 "limite_margem": [base[2]]}
+
+    estrategias = [
+        ("fixa (0 parâmetros)", None, None),
+        ("só margem (1 por reator)", g_margem, "reator"),
+        ("só mediana (1 por reator)", g_mediana, "reator"),
+        ("3 params (global)", grade, "global"),
+        ("3 params (por reator)", grade, "reator"),
+    ]
+
+    linhas = []
+    for nome, g, escopo in estrategias:
+        for i, corte in enumerate(cortes):
+            fim = cortes[i + 1] if i + 1 < len(cortes) else max(
+                a["dias"].max() for a in arrays.values()) + 1
+            m_treino = {c: arrays[c]["dias"] < corte for c in arrays}
+            m_teste = {c: (arrays[c]["dias"] >= corte) & (arrays[c]["dias"] <= fim) for c in arrays}
+            f_treino = {c: v[v < corte] for c, v in dias_falha.items()}
+            f_teste = {c: v[(v >= corte) & (v <= fim)] for c, v in dias_falha.items()}
+            if sum(len(v) for v in f_treino.values()) < 4 or sum(len(v) for v in f_teste.values()) < 1:
+                continue
+
+            if escopo is None:
+                lim = {c: base for c in arrays}
+            elif escopo == "global":
+                lm, _ = _melhor(g, m_treino, f_treino, list(arrays))
+                lim = {c: lm for c in arrays}
+            else:
+                lim = {}
+                for c in arrays:
+                    if len(f_treino[c]) < 2:
+                        lim[c] = base
+                        continue
+                    lm, _ = _melhor(g, {c: m_treino[c]}, {c: f_treino[c]}, [c])
+                    lim[c] = lm
+
+            vp = fp = tot = 0
+            for c in arrays:
+                d = _dias_alarme_regra(arrays[c], *lim[c], m_teste[c])
+                m = _metricas_dias(d, f_teste[c], janela_alarme, agrupar_dias)
+                vp += m["VP"]; fp += m["FP"]; tot += len(f_teste[c])
+            linhas.append({"estrategia": nome, "bloco": i + 1, "falhas_teste": tot,
+                           "VP": vp, "FP": fp})
+
+    df = pd.DataFrame(linhas)
+    resumo = df.groupby("estrategia").agg(blocos=("bloco", "size"),
+                                          falhas_teste=("falhas_teste", "sum"),
+                                          VP=("VP", "sum"), FP=("FP", "sum")).reset_index()
+    resumo["precisao"] = (resumo["VP"] / (resumo["VP"] + resumo["FP"]).replace(0, np.nan)).fillna(0).round(3)
+    resumo["recall"] = (resumo["VP"] / resumo["falhas_teste"]).round(3)
+    resumo["F2_fora_da_amostra"] = (
+        5 * resumo["precisao"] * resumo["recall"] /
+        (4 * resumo["precisao"] + resumo["recall"]).replace(0, np.nan)).fillna(0).round(3)
+    resumo["n_parametros"] = resumo["estrategia"].map(
+        {"fixa (0 parâmetros)": 0, "só margem (1 por reator)": 3, "só mediana (1 por reator)": 3,
+         "3 params (global)": 3, "3 params (por reator)": 9})
+    resumo = resumo.sort_values("F2_fora_da_amostra", ascending=False)
+
+    if verbose:
+        print(resumo.to_string(index=False))
+        print("\nLeitura: se as estratégias com mais parâmetros ficam ABAIXO da fixa, a amostra "
+              "não sustenta a calibração — o limiar estimado está decorando o passado. Note que "
+              "a linha 'fixa' leva vantagem embutida (o limiar base foi escolhido olhando a série "
+              "inteira), então ela é o piso otimista da comparação, não um teto.")
+    return df, resumo
+
+
+def comparar_limiares_por_reator(map_medicoes, map_falhas, conjuntos, margem=None,
+                                 janela_alarme=15, agrupar_dias=15, coluna=COLUNA_FE,
+                                 verbose=True):
+    """Compara conjuntos de limiares lado a lado, reator a reator.
+
+    `conjuntos` : {nome: {reator: (limite_max, limite_mediana, limite_margem)}}
+
+    Serve para responder "o que está em uso é melhor ou pior que o que a busca encontrou?"
+    sem precisar mexer nas funções internas de avaliação.
+    """
+    if margem is None:
+        _, _, margem = calcular_margem_cross_reator(map_medicoes, coluna, verbose=False)
+    arrays = preparar_arrays_regra(map_medicoes, margem, coluna)
+
+    linhas = []
+    for nome, limiares in conjuntos.items():
+        for cryst in map_medicoes:
+            lm = limiares[cryst]
+            dias_falha = _dias_int(pd.DatetimeIndex(map_falhas[cryst]["TIMESTAMP"]))
+            m = _metricas_dias(_dias_alarme_regra(arrays[cryst], *lm),
+                               dias_falha, janela_alarme, agrupar_dias)
+            linhas.append({"reator": cryst, "conjunto": nome,
+                           "limiares": "/".join(str(x) for x in lm),
+                           "falhas": len(dias_falha), **m})
+    df = pd.DataFrame(linhas).sort_values(["reator", "conjunto"]).reset_index(drop=True)
+    if verbose:
+        print(df.to_string(index=False))
+    return df
+
+
+# =============================================================================
+# Modo de falha: quais eventos o ferro tem como enxergar
+# =============================================================================
+#
+# O ferro só sobe no licor quando o revestimento vitrificado rompe e expõe aço carbono
+# à solução. Falha de agitador sem exposição de aço, vazamento externo por junta/selo e
+# vazamento em plug de reparo (área minúscula) não têm por que mover a medição — exigir
+# que o detector as preveja é medir contra um denominador impossível.
+#
+# `classificar_modo_falha` faz uma classificação POR TEXTO, que é um proxy: a
+# classificação definitiva tem de vir da planta (é o pedido nº 1 da entrega). Ela existe
+# para responder "quanto do desempenho medido é limitação do método e quanto é limitação
+# física do sinal?" — e a resposta muda o que se pode prometer.
+
+
+# ordem importa: a primeira regra que casar define o modo. A busca é feita em
+# OCORRIMENTO + OBSERVAÇÕES (o que aconteceu) e NÃO em SERVIÇOS EXECUTADOS (o que foi
+# feito) — instalar um plug é o reparo de um furo, não o modo de falha. Ignorar essa
+# distinção classificava 21 das 36 falhas como "plug", inclusive as duas paradas que a
+# planilha atribui ao ferro.
+REGRAS_MODO_FALHA = [
+    ("plug/reparo",
+     r"reinstala[çc][ãa]o de plug|substitui[çc][ãa]o do plug|"
+     r"(plug|reparo|luva)[^.]{0,60}(infiltra|danificad|vazamento|solt)|infiltra[çc]"),
+    ("revestimento/casco",
+     r"furo (no|do|passante)|furo n[oa] (costado|tampo|a[çc]o|revestimento|reator)|"
+     r"quebra do (vidro|revestimento)|quebra/furo|falha do revestimento|"
+     r"perda de material|at[ée] a parte met[áa]lica|poro passante|perfura"),
+    ("eixo/agitador",
+     r"eixo|agitador|h[ée]lice|p[áa] superior|p[áa] do|parafus|baffle"),
+    ("bocal/tampa/selo",
+     r"bocal|tampa|\bbv\b|selo|junta|domo|deep ?pipe"),
+    ("desgaste/constatação em inspeção",
+     r"desgaste|poro|concavidade|espessura|rugosidade|dano|trinca"),
+]
+
+# modos em que a física permite ferro no licor: aço exposto à solução
+MODOS_COM_FERRO = ("revestimento/casco", "eixo/agitador")
+
+# Correções do modo de falha, quando o texto do OCORRIMENTO descreve o gatilho da parada
+# (a análise de ferro) e não o dano — que aparece no registro da inspeção subsequente.
+# Mesmo padrão de CORRECOES_INSPECAO: (reator, data ancorada, modo, fonte).
+CORRECOES_MODO_FALHA = [
+    ("C3", "2013-11-23", "revestimento/casco",
+     "planilha: parada de emergência por ferro > 200 ppm; reator substituído em 30/11 com furo confirmado"),
+    ("C3", "2018-08-02", "revestimento/casco",
+     "planilha: 'quebra do revestimento vitríficado seguido de furo no costado ... perda de material'"),
+]
+
+
+def classificar_modo_falha(df_inspecoes, coluna_saida="ModoFalha"):
+    """Classifica cada apontamento por modo de falha a partir do texto livre.
+
+    **É um proxy.** A classificação definitiva tem de vir da planta — é o pedido nº 1 da
+    entrega, e a coluna existe justamente para receber a resposta deles. Aqui ela serve
+    para uma pergunta específica: *quanto do desempenho medido é limitação do método e
+    quanto é limitação física do sinal?*
+
+    Colunas novas:
+      `ModoFalha`      — plug/reparo | revestimento/casco | eixo/agitador |
+                         bocal/tampa/selo | desgaste/constatação em inspeção | indefinido
+      `FerroPlausivel` — o modo permite, fisicamente, ferro no licor (aço exposto)?
+    """
+    df = df_inspecoes.copy()
+    # só o que ACONTECEU, não o que foi feito
+    texto = (df["Ocorrimento"].fillna("") + " " + df["Observacoes"].fillna("")).str.lower()
+
+    modo = pd.Series("indefinido", index=df.index)
+    for nome, padrao in REGRAS_MODO_FALHA:
+        casa = texto.str.contains(padrao, regex=True) & (modo == "indefinido")
+        modo[casa] = nome
+
+    df[coluna_saida] = modo
+    df["ModoCorrigido"] = False
+    for cryst, data, valor, _fonte in CORRECOES_MODO_FALHA:
+        m = (df["Crystallizer"] == cryst) &             (pd.to_datetime(df["TS_Ajustado"]).dt.strftime("%Y-%m-%d") == data)
+        df.loc[m, coluna_saida] = valor
+        df.loc[m, "ModoCorrigido"] = True
+    df["FerroPlausivel"] = df[coluna_saida].isin(MODOS_COM_FERRO)
+    return df
+
+
+def avaliar_regra_por_subconjunto(map_medicoes, df_inspecoes, limiares, coluna_grupo,
+                                  margem=None, neutralizar=True, janela_alarme=15,
+                                  agrupar_dias=15, coluna=COLUNA_FE, verbose=True):
+    """Desempenho da regra quando o denominador é restrito a um subconjunto de falhas.
+
+    Responde à pergunta "e se a planta só cobrar do detector as falhas que o ferro tem
+    como enxergar?". Cada linha usa o MESMO alarme; o que muda é quais falhas contam.
+
+    `neutralizar=True`: um alarme que cai perto de uma falha fora do subconjunto **não**
+    conta como falso positivo — ele acertou algo real, apenas fora do escopo avaliado.
+    A coluna `FP_estrito` mostra a leitura pessimista (a falha excluída é ignorada e o
+    alarme vira falso positivo). A diferença entre as duas é, em si, informativa.
+    """
+    if margem is None:
+        _, _, margem = calcular_margem_cross_reator(map_medicoes, coluna, verbose=False)
+    arrays = preparar_arrays_regra(map_medicoes, margem, coluna)
+    sel = df_inspecoes[df_inspecoes["Selecionado"]]
+
+    grupos = {"TODAS as falhas": sel}
+    for valor in sorted(sel[coluna_grupo].astype(str).unique()):
+        grupos[f"só: {valor}"] = sel[sel[coluna_grupo].astype(str) == valor]
+
+    linhas = []
+    for nome, g in grupos.items():
+        if g.empty:
+            continue
+        vp = fp = fp_estrito = tot = 0
+        for cryst in map_medicoes:
+            alvo = _dias_int(pd.DatetimeIndex(g[g["Crystallizer"] == cryst]["TS_Ajustado"]))
+            fora = _dias_int(pd.DatetimeIndex(
+                sel[(sel["Crystallizer"] == cryst) & (~sel.index.isin(g.index))]["TS_Ajustado"]))
+            d = _dias_alarme_regra(arrays[cryst], *limiares)
+            m = _metricas_dias(d, alvo, janela_alarme, agrupar_dias,
+                               dias_neutros=fora if neutralizar else None)
+            m_est = _metricas_dias(d, alvo, janela_alarme, agrupar_dias)
+            vp += m["VP"]; fp += m["FP"]; fp_estrito += m_est["FP"]; tot += len(alvo)
+
+        def _m(v, f, t):
+            p = v / (v + f) if v + f else 0.0
+            r = v / t if t else 0.0
+            return round(p, 3), round(r, 3), (round(5 * p * r / (4 * p + r), 3) if p + r else 0.0)
+
+        p, r, f2 = _m(vp, fp, tot)
+        _, _, f2e = _m(vp, fp_estrito, tot)
+        linhas.append({"subconjunto": nome, "n_falhas": tot, "VP": vp, "FP": fp,
+                       "precisao": p, "recall": r, "F2": f2,
+                       "FP_estrito": fp_estrito, "F2_estrito": f2e})
+
+    df = pd.DataFrame(linhas)
+    if verbose:
+        print(df.to_string(index=False))
+        print("\nFP / F2 : alarme perto de falha excluída é NEUTRO (leitura operacional).")
+        print("FP_estrito / F2_estrito : essa falha é ignorada e o alarme vira falso positivo.")
+    return df
