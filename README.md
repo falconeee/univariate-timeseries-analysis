@@ -167,7 +167,8 @@ pouco ferro. A regra vigente, no mesmo período, disparou nos dois reatores que 
 .
 ├── Crystallizer #1#2#3.ipynb   # narrativa: carga, análises, validação e resumo executivo
 ├── utils.py                    # todas as funções do estudo (importado com `from utils import *`)
-├── requirements.txt
+├── pyproject.toml              # dependências (uv)
+├── uv.lock
 └── data/                       # não versionado — ver "Dados"
 ```
 
@@ -205,9 +206,8 @@ Convenções: a coluna analisada é sempre `COLUNA_FE`; `janelas` são listas de
 Python 3.12.
 
 ```bash
-python -m venv .venv
+uv sync                            # cria o .venv a partir do pyproject.toml + uv.lock
 source .venv/bin/activate          # Windows: .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
 ```
 
 1. Coloque os arquivos de dados em `data/` (ver [Dados](#dados)).
