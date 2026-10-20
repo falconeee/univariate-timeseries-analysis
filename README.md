@@ -1,7 +1,7 @@
 # Ferro nos cristalizadores de PIA — o sinal antecipa a falha do vitrificado?
 
 Estudo exploratório de séries temporais univariadas sobre a contaminação por ferro nos três
-cristalizadores (reatores vitrificados de PIA) de uma planta do processo industrial.
+cristalizadores (reatores vitrificados de PIA) de uma planta industrial.
 
 O laboratório mede o ferro no licor de cada reator (`Resultado de Ferro (ppm)`, ~6 amostras por
 dia, 2011–2026). Quando o valor passa de um limite fixo de **5 ppm**, o lote pode ser condenado e o
